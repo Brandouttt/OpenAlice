@@ -121,43 +121,86 @@ describe('MaxPositionSizeGuard', () => {
 // ==================== CooldownGuard ====================
 
 describe('CooldownGuard', () => {
-  it('allows first trade', () => {
+  it('allows first trade', async () => {
     const guard = new CooldownGuard({ minIntervalMs: 60_000 })
     const ctx = makeContext()
-    expect(guard.check(ctx)).toBeNull()
+    expect(await guard.check(ctx)).toBeNull()
   })
 
-  it('rejects rapid repeat trade for same symbol', () => {
+  it('rejects rapid repeat trade for same symbol', async () => {
     const guard = new CooldownGuard({ minIntervalMs: 60_000 })
     const ctx = makeContext()
 
-    guard.check(ctx) // first — allowed
-    const result = guard.check(ctx) // second — rejected
+    await guard.check(ctx) // first — allowed
+    const result = await guard.check(ctx) // second — rejected
     expect(result).not.toBeNull()
     expect(result).toContain('Cooldown active')
     expect(result).toContain('AAPL')
   })
 
-  it('allows trade for different symbol', () => {
+  it('allows trade for different symbol', async () => {
     const guard = new CooldownGuard({ minIntervalMs: 60_000 })
 
-    guard.check(makeContext({
+    await guard.check(makeContext({
       operation: makePlaceOrderOp({ symbol: 'AAPL' }),
     }))
 
-    const result = guard.check(makeContext({
+    const result = await guard.check(makeContext({
       operation: makePlaceOrderOp({ symbol: 'GOOG' }),
     }))
     expect(result).toBeNull()
   })
 
-  it('skips non-placeOrder operations', () => {
+  it('skips non-placeOrder operations', async () => {
     const guard = new CooldownGuard({ minIntervalMs: 60_000 })
     const contract = makeContract({ symbol: 'AAPL' })
     const ctx = makeContext({
       operation: { action: 'closePosition', contract },
     })
-    expect(guard.check(ctx)).toBeNull()
+    expect(await guard.check(ctx)).toBeNull()
+  })
+
+  // ---- Persistence ----
+
+  it('persists lastTradeTime across instances when accountId is set', async () => {
+    const { mkdtemp, rm } = await import('fs/promises')
+    const { tmpdir } = await import('os')
+    const { join } = await import('path')
+    const tmpRoot = await mkdtemp(join(tmpdir(), 'cooldown-test-'))
+    const cwdSpy = vi.spyOn(process, 'cwd').mockReturnValue(tmpRoot)
+
+    try {
+      const accountId = 'test-uta-1'
+      const ctx = makeContext()
+
+      // Instance 1: trade once, then drop the instance.
+      const g1 = new CooldownGuard({ minIntervalMs: 60_000, accountId })
+      expect(await g1.check(ctx)).toBeNull()
+
+      // Wait for fire-and-forget persist to flush.
+      await new Promise(r => setTimeout(r, 20))
+
+      // Instance 2 (simulates restart): should see the prior trade
+      // and reject a same-symbol trade within the cooldown window.
+      const g2 = new CooldownGuard({ minIntervalMs: 60_000, accountId })
+      const result = await g2.check(ctx)
+      expect(result).not.toBeNull()
+      expect(result).toContain('Cooldown active')
+      expect(result).toContain('AAPL')
+    } finally {
+      cwdSpy.mockRestore()
+      await rm(tmpRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('stays RAM-only when no accountId is provided', async () => {
+    // No accountId → no disk read/write at all. Two instances must
+    // behave independently (existing unit-test contract).
+    const g1 = new CooldownGuard({ minIntervalMs: 60_000 })
+    expect(await g1.check(makeContext())).toBeNull()
+
+    const g2 = new CooldownGuard({ minIntervalMs: 60_000 })
+    expect(await g2.check(makeContext())).toBeNull()
   })
 })
 

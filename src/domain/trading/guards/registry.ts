@@ -18,9 +18,21 @@ export function registerGuard(entry: GuardRegistryEntry): void {
   registry.set(entry.type, entry.create)
 }
 
+/**
+ * Context that resolveGuards forwards into every guard's options blob.
+ * Existing per-guard `options` win on key collision; context fills in
+ * missing keys. Enables guards to learn the owning UTA without each
+ * config entry having to repeat `accountId`.
+ */
+export interface GuardResolveContext {
+  /** Owning UTA id — guards that persist to disk key off this. */
+  accountId?: string
+}
+
 /** Resolve config entries into guard instances via the registry. */
 export function resolveGuards(
   configs: Array<{ type: string; options?: Record<string, unknown> }>,
+  context: GuardResolveContext = {},
 ): OperationGuard[] {
   const guards: OperationGuard[] = []
   for (const cfg of configs) {
@@ -29,7 +41,9 @@ export function resolveGuards(
       console.warn(`guard: unknown type "${cfg.type}", skipped`)
       continue
     }
-    guards.push(factory(cfg.options ?? {}))
+    // Per-config options win; context fills missing keys only.
+    const merged = { ...context, ...(cfg.options ?? {}) }
+    guards.push(factory(merged))
   }
   return guards
 }

@@ -162,7 +162,7 @@ export class UnifiedTradingAccount {
           throw new Error(`Unknown operation action: ${(op as { action: string }).action}`)
       }
     }
-    const guards = resolveGuards(options.guards ?? [])
+    const guards = resolveGuards(options.guards ?? [], { accountId: broker.id })
     const guardedDispatcher = createGuardPipeline(dispatcher, broker, guards)
 
     const gitConfig = {
