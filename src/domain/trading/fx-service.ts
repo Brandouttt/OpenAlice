@@ -113,19 +113,40 @@ export class FxService {
       return { rate: cached.rate, source: 'live', updatedAt: cached.updatedAt }
     }
 
-    // 2. Try to fetch fresh data (only if we have a client)
+    // 2. Try to fetch fresh data (only if we have a client).
+    //
+    // OpenBB CurrencySnapshots `last_rate` semantics depend on quote_type
+    // (default `indirect` — 1 unit of base = X units of counter). yfinance
+    // historically has not always honored this consistently across pairs,
+    // which produces occasional inverted rates (e.g. 7.25 stored where
+    // 0.138 was expected for CNY→USD). When that happens downstream
+    // multiplication blows snapshot values up by ~50x. We sanity-check
+    // against the default table and reject anything more than ~3x off.
     if (this.client) {
       try {
         const snapshots = await this.client.getSnapshots({
           base: key,
           counter_currencies: 'USD',
+          quote_type: 'indirect',
           provider: 'yfinance',
         })
         const snap = snapshots.find(s => s.counter_currency?.toUpperCase() === 'USD')
         if (snap && snap.last_rate > 0) {
-          const updatedAt = new Date().toISOString()
-          this.liveRates.set(key, { rate: snap.last_rate, updatedAt, fetchedAt: now })
-          return { rate: snap.last_rate, source: 'live', updatedAt }
+          if (this.isPlausibleRate(key, snap.last_rate)) {
+            const updatedAt = new Date().toISOString()
+            this.liveRates.set(key, { rate: snap.last_rate, updatedAt, fetchedAt: now })
+            return { rate: snap.last_rate, source: 'live', updatedAt }
+          } else {
+            // Live looks inverted vs. default table — log and fall through
+            // to default. Using a wrong-direction rate corrupts every
+            // downstream snapshot value.
+            const expected = DEFAULT_RATES[key]?.rate
+            console.warn(
+              `FxService: live rate for ${key}/USD = ${snap.last_rate} ` +
+              `looks implausible vs default ${expected ?? '?'}; ignoring. ` +
+              `Likely a yfinance quote_type direction issue.`,
+            )
+          }
         }
       } catch {
         // Silently fall through — stale cache or default table will handle it
@@ -153,6 +174,23 @@ export class FxService {
       console.warn(`FxService: unknown currency "${key}", defaulting to 1:1 USD`)
     }
     return { rate: 1, source: 'default', updatedAt: '1970-01-01' }
+  }
+
+  /**
+   * Sanity-check a live-fetched rate against the default table. Rejects
+   * anything more than 3x off in either direction, which is enough to
+   * catch the inverted-direction case (~50x off for CNY/USD) without
+   * flagging legit market moves.
+   *
+   * Currencies not in the default table (e.g. emerging-market pairs we
+   * don't ship a fallback for) trust the live value — there's no
+   * reference point to compare against.
+   */
+  private isPlausibleRate(currency: string, rate: number): boolean {
+    const def = DEFAULT_RATES[currency]
+    if (!def) return true
+    const ratio = rate / def.rate
+    return ratio >= 1 / 3 && ratio <= 3
   }
 
   /**

@@ -38,6 +38,7 @@ describe('FxService', () => {
     expect(client.getSnapshots).toHaveBeenCalledWith({
       base: 'HKD',
       counter_currencies: 'USD',
+      quote_type: 'indirect',
       provider: 'yfinance',
     })
   })
@@ -171,5 +172,50 @@ describe('FxService', () => {
     const fx = new FxService(client)
     const rate = await fx.getRate('hkd')
     expect(rate.rate).toBe(0.1282)
+  })
+
+  // ==================== Inverted-rate sanity gate ====================
+
+  it('rejects an implausible live rate and falls back to default table', async () => {
+    // yfinance occasionally returns rates in the wrong direction
+    // (~7.8 stored where ~0.128 was expected for HKD/USD). That
+    // multiplies snapshot values by ~60x downstream — we'd rather
+    // be a few hours stale on the default table than that wrong.
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const badClient = makeMockClient([
+      { base_currency: 'HKD', counter_currency: 'USD', last_rate: 7.8 },
+    ])
+    const fx = new FxService(badClient)
+
+    const rate = await fx.getRate('HKD')
+    expect(rate.source).toBe('default')
+    expect(rate.rate).toBeCloseTo(0.128, 3)
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('looks implausible'),
+    )
+    warnSpy.mockRestore()
+  })
+
+  it('accepts a live rate close to the default (real market drift)', async () => {
+    // Real rates do drift — 0.13 vs default 0.128 is fine.
+    const goodClient = makeMockClient([
+      { base_currency: 'HKD', counter_currency: 'USD', last_rate: 0.13 },
+    ])
+    const fx = new FxService(goodClient)
+    const rate = await fx.getRate('HKD')
+    expect(rate.source).toBe('live')
+    expect(rate.rate).toBe(0.13)
+  })
+
+  it('trusts live rates for currencies not in the default table', async () => {
+    // Currencies we don't ship a fallback for can't be sanity-checked
+    // — passes through trusted.
+    const exoticClient = makeMockClient([
+      { base_currency: 'XOF', counter_currency: 'USD', last_rate: 0.0017 },
+    ])
+    const fx = new FxService(exoticClient)
+    const rate = await fx.getRate('XOF')
+    expect(rate.source).toBe('live')
+    expect(rate.rate).toBe(0.0017)
   })
 })
