@@ -92,6 +92,7 @@ describe('heartbeat', () => {
         connectorCenter, cronEngine, registry: listenerRegistry,
         agentCenter: mockEngine as any,
         session,
+        dedupPath: null,
       })
 
       await heartbeat.start()
@@ -108,6 +109,7 @@ describe('heartbeat', () => {
         connectorCenter, cronEngine, registry: listenerRegistry,
         agentCenter: mockEngine as any,
         session,
+        dedupPath: null,
       })
 
       await heartbeat.start()
@@ -119,6 +121,7 @@ describe('heartbeat', () => {
         connectorCenter, cronEngine, registry: listenerRegistry,
         agentCenter: mockEngine as any,
         session,
+        dedupPath: null,
       })
 
       await heartbeat.start()
@@ -134,6 +137,7 @@ describe('heartbeat', () => {
         connectorCenter, cronEngine, registry: listenerRegistry,
         agentCenter: mockEngine as any,
         session,
+        dedupPath: null,
       })
 
       await heartbeat.start()
@@ -161,6 +165,7 @@ describe('heartbeat', () => {
         connectorCenter, cronEngine, registry: listenerRegistry,
         agentCenter: mockEngine as any,
         session,
+        dedupPath: null,
       })
       await heartbeat.start()
 
@@ -190,6 +195,7 @@ describe('heartbeat', () => {
         connectorCenter, cronEngine, registry: listenerRegistry,
         agentCenter: mockEngine as any,
         session,
+        dedupPath: null,
       })
       await heartbeat.start()
 
@@ -223,6 +229,7 @@ describe('heartbeat', () => {
         connectorCenter, cronEngine, registry: listenerRegistry,
         agentCenter: mockEngine as any,
         session,
+        dedupPath: null,
       })
       await heartbeat.start()
 
@@ -243,6 +250,7 @@ describe('heartbeat', () => {
         connectorCenter, cronEngine, registry: listenerRegistry,
         agentCenter: mockEngine as any,
         session,
+        dedupPath: null,
       })
       await heartbeat.start()
 
@@ -306,6 +314,7 @@ describe('heartbeat', () => {
         connectorCenter, cronEngine, registry: listenerRegistry,
         agentCenter: mockEngine as any,
         session,
+        dedupPath: null,
       })
       await heartbeat.start()
 
@@ -341,6 +350,7 @@ describe('heartbeat', () => {
         connectorCenter, cronEngine, registry: listenerRegistry,
         agentCenter: mockEngine as any,
         session,
+        dedupPath: null,
       })
       await heartbeat.start()
 
@@ -367,6 +377,7 @@ describe('heartbeat', () => {
         connectorCenter, cronEngine, registry: listenerRegistry,
         agentCenter: mockEngine as any,
         session,
+        dedupPath: null,
       })
       await heartbeat.start()
 
@@ -391,6 +402,7 @@ describe('heartbeat', () => {
         connectorCenter, cronEngine, registry: listenerRegistry,
         agentCenter: mockEngine as any,
         session,
+        dedupPath: null,
       })
       await heartbeat.start()
       heartbeat.stop()
@@ -411,6 +423,7 @@ describe('heartbeat', () => {
         connectorCenter, cronEngine, registry: listenerRegistry,
         agentCenter: mockEngine as any,
         session,
+        dedupPath: null,
       })
       await heartbeat.start()
 
@@ -429,6 +442,7 @@ describe('heartbeat', () => {
         connectorCenter, cronEngine, registry: listenerRegistry,
         agentCenter: mockEngine as any,
         session,
+        dedupPath: null,
       })
       await heartbeat.start()
 
@@ -448,6 +462,7 @@ describe('heartbeat', () => {
         connectorCenter, cronEngine, registry: listenerRegistry,
         agentCenter: mockEngine as any,
         session,
+        dedupPath: null,
       })
       await heartbeat.start()
       await heartbeat.setEnabled(true)
@@ -468,6 +483,7 @@ describe('heartbeat', () => {
         connectorCenter, cronEngine, registry: listenerRegistry,
         agentCenter: mockEngine as any,
         session,
+        dedupPath: null,
       })
       await heartbeat.start()
 
@@ -633,6 +649,34 @@ describe('HeartbeatDedup', () => {
     const d = new HeartbeatDedup(1000)
     d.record('hello', 100)
     expect(d.isDuplicate('world', 500)).toBe(false)
+  })
+
+  // ---- Persistence ----
+
+  it('persists lastText / lastSentAt across instances when path is set', async () => {
+    const path = tempPath('json')
+
+    // Instance 1: record once.
+    const d1 = new HeartbeatDedup(1000, path)
+    d1.record('alert!', 100)
+
+    // Wait for fire-and-forget persist to flush.
+    await new Promise(r => setTimeout(r, 30))
+
+    // Instance 2 (simulates restart): must see prior record and
+    // flag a same-text message within the window as duplicate.
+    const d2 = new HeartbeatDedup(1000, path)
+    expect(d2.isDuplicate('alert!', 500)).toBe(true)
+    expect(d2.isDuplicate('alert!', 1200)).toBe(false) // window expired
+  })
+
+  it('stays RAM-only when no path is provided', () => {
+    const d1 = new HeartbeatDedup(1000)
+    d1.record('hello', 100)
+
+    const d2 = new HeartbeatDedup(1000)
+    // Different instance, no shared path → must not see prior record.
+    expect(d2.isDuplicate('hello', 500)).toBe(false)
   })
 })
 

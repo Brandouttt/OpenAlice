@@ -15,6 +15,9 @@
  *   - heartbeat.error { error, durationMs }
  */
 
+import { readFileSync } from 'node:fs'
+import { mkdir, writeFile } from 'node:fs/promises'
+import { dirname } from 'node:path'
 import type { EventLogEntry } from '../../core/event-log.js'
 import type { CronFirePayload } from '../../core/agent-event.js'
 import type { AgentCenter } from '../../core/agent-center.js'
@@ -90,6 +93,12 @@ export interface HeartbeatOpts {
   session?: SessionStore
   /** Inject clock for testing. */
   now?: () => number
+  /**
+   * Path for the dedup state file. Defaults to
+   * `data/heartbeat/dedup.json`. Set to `null` to disable persistence
+   * entirely (test-friendly RAM-only mode).
+   */
+  dedupPath?: string | null
 }
 
 export interface Heartbeat {
@@ -115,7 +124,12 @@ export function createHeartbeat(opts: HeartbeatOpts): Heartbeat {
   let enabled = config.enabled
   let registered = false
 
-  const dedup = new HeartbeatDedup()
+  // dedupPath: undefined → default disk path; null → RAM-only.
+  // Tests pass null; production pickup the default.
+  const dedupPath =
+    opts.dedupPath === null ? undefined
+    : opts.dedupPath ?? 'data/heartbeat/dedup.json'
+  const dedup = new HeartbeatDedup(undefined, dedupPath)
 
   async function handleFire(
     entry: EventLogEntry<CronFirePayload>,
@@ -385,26 +399,88 @@ function currentMinutesInTimezone(tz: string, nowMs?: number): number {
 
 // ==================== Dedup ====================
 
+interface HeartbeatDedupDiskState {
+  lastText: string | null
+  lastSentAt: number
+}
+
 /**
  * Suppress identical heartbeat messages within a time window (default 24h).
+ *
+ * When given a `path`, lastText/lastSentAt persist to disk so the dedup
+ * window survives a process restart. Without a path the dedup runs
+ * RAM-only (test-friendly default).
  */
 export class HeartbeatDedup {
   private lastText: string | null = null
   private lastSentAt = 0
   private windowMs: number
+  private readonly path?: string
+  private loaded = false
 
-  constructor(windowMs = 24 * 60 * 60 * 1000) {
+  constructor(windowMs = 24 * 60 * 60 * 1000, path?: string) {
     this.windowMs = windowMs
+    this.path = path
+  }
+
+  /**
+   * Lazy load on first isDuplicate / record. Sync I/O is fine —
+   * heartbeat fires every ~30m, the load runs once per process.
+   */
+  private loadSync(): void {
+    if (this.loaded) return
+    this.loaded = true
+    if (!this.path) return
+    try {
+      const raw = readFileSync(this.path, 'utf-8')
+      const state = JSON.parse(raw) as HeartbeatDedupDiskState
+      if (typeof state.lastText === 'string' || state.lastText === null) {
+        this.lastText = state.lastText
+      }
+      if (typeof state.lastSentAt === 'number' && Number.isFinite(state.lastSentAt)) {
+        this.lastSentAt = state.lastSentAt
+      }
+    } catch {
+      // No saved state / corrupt → start empty (same as before).
+    }
   }
 
   isDuplicate(text: string, nowMs = Date.now()): boolean {
+    if (!this.loaded) this.loadSync()
     if (this.lastText === null) return false
     if (text !== this.lastText) return false
     return (nowMs - this.lastSentAt) < this.windowMs
   }
 
   record(text: string, nowMs = Date.now()): void {
+    if (!this.loaded) this.loadSync()
     this.lastText = text
     this.lastSentAt = nowMs
+    this.persistAsync()
+  }
+
+  /**
+   * Fire-and-forget persistence. Heartbeat fires every ~30m, so disk
+   * latency is irrelevant — but failures should still not crash the
+   * notify path.
+   */
+  private persistAsync(): void {
+    if (!this.path) return
+    const path = this.path
+    const state: HeartbeatDedupDiskState = {
+      lastText: this.lastText,
+      lastSentAt: this.lastSentAt,
+    }
+    void (async () => {
+      try {
+        await mkdir(dirname(path), { recursive: true })
+        await writeFile(path, JSON.stringify(state, null, 2))
+      } catch (err) {
+        console.warn(
+          'heartbeat-dedup: persist failed:',
+          err instanceof Error ? err.message : err,
+        )
+      }
+    })()
   }
 }
