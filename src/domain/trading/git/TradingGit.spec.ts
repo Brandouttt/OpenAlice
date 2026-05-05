@@ -166,18 +166,55 @@ describe('TradingGit', () => {
       await expect(git.push()).rejects.toThrow('please commit first')
     })
 
-    it('calls onCommit callback with exported state', async () => {
+    it('calls onCommit callback after each state change with exported state', async () => {
       const onCommit = vi.fn()
       const gitWithCb = new TradingGit({ ...config, onCommit })
 
-      gitWithCb.add(buyOp())
-      gitWithCb.commit('msg')
-      await gitWithCb.push()
+      gitWithCb.add(buyOp())          // staging-area mutation → fires (fire-and-forget)
+      gitWithCb.commit('msg')         // pendingMessage/Hash mutation → fires
+      await gitWithCb.push()          // commits-list mutation → fires
 
-      expect(onCommit).toHaveBeenCalledTimes(1)
-      const exported = onCommit.mock.calls[0][0]
-      expect(exported.commits).toHaveLength(1)
-      expect(exported.head).toHaveLength(8)
+      // Allow fire-and-forget persists from add/commit to settle.
+      await new Promise(r => setImmediate(r))
+
+      // Three state-changing calls → at least three onCommit invocations.
+      // Exact count depends on microtask scheduling so we assert ≥ 3.
+      expect(onCommit.mock.calls.length).toBeGreaterThanOrEqual(3)
+
+      // The final state (after push) must carry the new commit + head.
+      const finalExport = onCommit.mock.calls[onCommit.mock.calls.length - 1][0]
+      expect(finalExport.commits).toHaveLength(1)
+      expect(finalExport.head).toHaveLength(8)
+    })
+
+    it('persists staging area through restart (round-trip add/commit → restore)', async () => {
+      // Mutate then export — captures the in-progress staging area.
+      const g1 = new TradingGit(config)
+      g1.add(buyOp())
+      g1.commit('half-finished')
+      const exported = g1.exportState()
+
+      // Round-trip through JSON to mirror real disk persistence.
+      const roundTripped = JSON.parse(JSON.stringify(exported))
+
+      // Restore in a "new process" — staging must come back so the
+      // pending push survives.
+      const g2 = TradingGit.restore(roundTripped, config)
+      const status = g2.status()
+      expect(status.staged).toHaveLength(1)
+      expect(status.pendingMessage).toBe('half-finished')
+      expect(status.pendingHash).toHaveLength(8)
+    })
+
+    it('omitting staging on the export state still loads (backward compat)', () => {
+      // State files written before the staging field existed must still
+      // restore cleanly — no crash, just empty staging.
+      const legacyExport = { commits: [], head: null }
+      const g = TradingGit.restore(legacyExport, config)
+      const status = g.status()
+      expect(status.staged).toHaveLength(0)
+      expect(status.pendingMessage).toBeNull()
+      expect(status.pendingHash).toBeNull()
     })
 
     it('handles rejected operations gracefully', async () => {

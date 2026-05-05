@@ -54,6 +54,7 @@ export class TradingGit implements ITradingGit {
 
   add(operation: Operation): AddResult {
     this.stagingArea.push(operation)
+    this.persistAsync()
     return {
       staged: true,
       index: this.stagingArea.length - 1,
@@ -74,6 +75,7 @@ export class TradingGit implements ITradingGit {
       parentHash: this.head,
     })
     this.pendingMessage = message
+    this.persistAsync()
 
     return {
       prepared: true,
@@ -298,14 +300,51 @@ export class TradingGit implements ITradingGit {
   // ==================== Serialization ====================
 
   exportState(): GitExportState {
-    return { commits: [...this.commits], head: this.head }
+    return {
+      commits: [...this.commits],
+      head: this.head,
+      staging: {
+        area: [...this.stagingArea],
+        pendingMessage: this.pendingMessage,
+        pendingHash: this.pendingHash,
+        currentRound: this.currentRound,
+      },
+    }
   }
 
   static restore(state: GitExportState, config: TradingGitConfig): TradingGit {
     const git = new TradingGit(config)
     git.commits = state.commits.map(TradingGit.rehydrateCommit)
     git.head = state.head
+    if (state.staging) {
+      // Same Decimal-rehydration treatment as commits — staged ops
+      // round-trip through JSON the same way.
+      git.stagingArea = state.staging.area.map(TradingGit.rehydrateOperation)
+      git.pendingMessage = state.staging.pendingMessage
+      git.pendingHash = state.staging.pendingHash
+      git.currentRound = state.staging.currentRound
+    }
     return git
+  }
+
+  /**
+   * Fire-and-forget persistence trigger for staging-area mutations
+   * (add / commit-prepare / setCurrentRound). push/reject/sync already
+   * call onCommit themselves after their own state changes.
+   *
+   * Failures are logged but never block the caller — disk going away
+   * shouldn't break in-flight trading. The on-disk state will simply
+   * lag behind RAM until the next successful write.
+   */
+  private persistAsync(): void {
+    const onCommit = this.config.onCommit
+    if (!onCommit) return
+    void Promise.resolve(onCommit(this.exportState())).catch(err => {
+      console.warn(
+        'TradingGit: staging persist failed:',
+        err instanceof Error ? err.message : err,
+      )
+    })
   }
 
   /** Rehydrate Decimal fields lost during JSON round-trip. */
@@ -372,6 +411,7 @@ export class TradingGit implements ITradingGit {
 
   setCurrentRound(round: number): void {
     this.currentRound = round
+    this.persistAsync()
   }
 
   // ==================== Sync ====================

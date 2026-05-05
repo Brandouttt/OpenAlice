@@ -125,9 +125,27 @@ export interface CommitLogEntry {
 
 // ==================== Export State ====================
 
+/**
+ * Snapshot of in-progress (staged but not yet pushed) work. Optional
+ * on the export shape so older state files without it still load.
+ */
+export interface GitStagingExport {
+  area: Operation[]
+  pendingMessage: string | null
+  pendingHash: CommitHash | null
+  currentRound: number | undefined
+}
+
 export interface GitExportState {
   commits: GitCommit[]
   head: CommitHash | null
+  /**
+   * Persisted staging area. Lets `add()` / `commit()` survive a
+   * process restart instead of losing in-progress work.
+   * Optional for backward-compat with state files written before
+   * this field existed.
+   */
+  staging?: GitStagingExport
 }
 
 // ==================== Sync ====================
