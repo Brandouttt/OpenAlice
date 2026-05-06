@@ -21,6 +21,7 @@ import { Order, UNSET_DECIMAL } from '@traderalice/ibkr'
 import { runBacktest } from './engine.js'
 import type { Bar, Strategy } from './types.js'
 import { MockBroker, makeContract } from '../trading/brokers/mock/index.js'
+import { makeSmaCrossover } from '../strategy/sma-crossover.js'
 import '../trading/contract-ext.js'
 
 // ==================== Synthetic data generator ====================
@@ -123,64 +124,13 @@ function generateSpyLikeBars({
   return bars
 }
 
-// ==================== SMA crossover strategy ====================
+// SMA crossover implementation lives in src/domain/strategy/sma-crossover.ts
+// — imported above as `makeSmaCrossover`. This spec calls it with the
+// same fast=20, slow=50, qty=100 parameters used in Phase 1.6a so the
+// numeric baseline (Sharpe ≈ 0.371, MaxDD ≈ 2.33%) doesn't drift.
 
-function sma(closes: readonly number[], period: number): number | null {
-  if (closes.length < period) return null
-  let sum = 0
-  for (let i = closes.length - period; i < closes.length; i++) sum += closes[i]
-  return sum / period
-}
-
-function makeOrder(action: 'BUY' | 'SELL', qty: number): Order {
-  const order = new Order()
-  order.action = action
-  order.orderType = 'MKT'
-  order.totalQuantity = new Decimal(qty)
-  order.lmtPrice = UNSET_DECIMAL
-  order.auxPrice = UNSET_DECIMAL
-  order.trailStopPrice = UNSET_DECIMAL
-  order.trailingPercent = UNSET_DECIMAL
-  order.cashQty = UNSET_DECIMAL
-  return order
-}
-
-/**
- * Long-only SMA crossover.
- *   - Enter long 100 shares on the bar where MA(20) crosses above MA(50).
- *   - Exit (sell 100 shares) on the bar where MA(20) crosses below MA(50).
- *
- * Holds at most one position at a time. Strategy issues market orders
- * which under deferred-fill mode execute at next bar's open.
- */
-function makeSmaCrossover(qty = 100): Strategy {
-  const fast = 20
-  const slow = 50
-  let inPosition = false
-
-  return async ({ broker, history, symbol }) => {
-    if (history.length < slow + 1) return // not enough data for a crossover signal
-
-    const closes = history.map(b => Number(b.close))
-    const fastNow = sma(closes, fast)
-    const slowNow = sma(closes, slow)
-    const fastPrev = sma(closes.slice(0, -1), fast)
-    const slowPrev = sma(closes.slice(0, -1), slow)
-    if (fastNow == null || slowNow == null || fastPrev == null || slowPrev == null) return
-
-    const crossedUp = fastPrev <= slowPrev && fastNow > slowNow
-    const crossedDown = fastPrev >= slowPrev && fastNow < slowNow
-
-    const contract = makeContract({ symbol, aliceId: `mock-paper|${symbol}` })
-
-    if (!inPosition && crossedUp) {
-      await broker.placeOrder(contract, makeOrder('BUY', qty))
-      inPosition = true
-    } else if (inPosition && crossedDown) {
-      await broker.placeOrder(contract, makeOrder('SELL', qty))
-      inPosition = false
-    }
-  }
+function buildSmaStrategy(qty = 100): Strategy {
+  return makeSmaCrossover({ fast: 20, slow: 50, qty })
 }
 
 // ==================== The baseline test ====================
@@ -214,7 +164,7 @@ describe('Phase 1.6 — SMA(20/50) crossover on synthetic SPY-like data', () => 
         symbol: 'SPY',
         bars,
         initialCash: 100_000,
-        strategy: makeSmaCrossover(100),
+        strategy: buildSmaStrategy(100),
       },
       broker,
     )
@@ -294,7 +244,7 @@ describe('Phase 1.6 — SMA(20/50) crossover on synthetic SPY-like data', () => 
     })
 
     const report = await runBacktest(
-      { symbol: 'SPY', bars, initialCash: 100_000, strategy: makeSmaCrossover(100) },
+      { symbol: 'SPY', bars, initialCash: 100_000, strategy: buildSmaStrategy(100) },
       broker,
     )
 
