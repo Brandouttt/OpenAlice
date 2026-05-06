@@ -425,3 +425,202 @@ describe('factory helpers', () => {
     expect(r.orderId).toBe('order-1')
   })
 })
+
+// ==================== Commission ====================
+
+describe('commission', () => {
+  it('charges commissionPerShare on each fill', async () => {
+    const b = new MockBroker({ cash: 100_000, commissionPerShare: 0.005 })
+    b.setQuote('AAPL', 150)
+    const contract = makeContract({ aliceId: 'mock-paper|AAPL', symbol: 'AAPL' })
+    const order = new Order()
+    order.action = 'BUY'
+    order.orderType = 'MKT'
+    order.totalQuantity = new Decimal(100)
+    await b.placeOrder(contract, order)
+
+    // Cash = 100_000 - 100×150 - max(100×0.005, 0) = 100_000 - 15_000 - 0.5 = 84_999.50
+    const account = await b.getAccount()
+    expect(account.totalCashValue).toBe('84999.5')
+    expect(b.totalCommissionsPaid).toBe('0.5')
+  })
+
+  it('applies commissionMin floor when per-share total is below it', async () => {
+    const b = new MockBroker({
+      cash: 100_000,
+      commissionPerShare: 0.005,
+      commissionMin: 1,
+    })
+    b.setQuote('AAPL', 150)
+    const contract = makeContract({ aliceId: 'mock-paper|AAPL', symbol: 'AAPL' })
+    const order = new Order()
+    order.action = 'BUY'
+    order.orderType = 'MKT'
+    order.totalQuantity = new Decimal(10) // 10 × 0.005 = 0.05, below $1 min
+    await b.placeOrder(contract, order)
+
+    // Cash = 100_000 - 1500 - 1 = 98_499
+    const account = await b.getAccount()
+    expect(account.totalCashValue).toBe('98499')
+    expect(b.totalCommissionsPaid).toBe('1')
+  })
+
+  it('charges commission on SELL too, deducting from proceeds', async () => {
+    const b = new MockBroker({
+      cash: 100_000,
+      commissionPerShare: 0.005,
+      commissionMin: 1,
+    })
+    b.setQuote('AAPL', 100)
+    const contract = makeContract({ aliceId: 'mock-paper|AAPL', symbol: 'AAPL' })
+
+    const buy = new Order()
+    buy.action = 'BUY'
+    buy.orderType = 'MKT'
+    buy.totalQuantity = new Decimal(10)
+    await b.placeOrder(contract, buy)
+
+    const sell = new Order()
+    sell.action = 'SELL'
+    sell.orderType = 'MKT'
+    sell.totalQuantity = new Decimal(10)
+    await b.placeOrder(contract, sell)
+
+    // BUY: cash = 100_000 - 1000 - 1 = 98_999
+    // SELL: cash = 98_999 + 1000 - 1 = 99_998
+    const account = await b.getAccount()
+    expect(account.totalCashValue).toBe('99998')
+    expect(b.totalCommissionsPaid).toBe('2')
+  })
+})
+
+// ==================== Slippage ====================
+
+describe('slippage', () => {
+  it('BUYs fill above quoted price by slippageBps', async () => {
+    const b = new MockBroker({ cash: 100_000, slippageBps: 10 }) // 0.10%
+    b.setQuote('AAPL', 100)
+    const contract = makeContract({ aliceId: 'mock-paper|AAPL', symbol: 'AAPL' })
+    const order = new Order()
+    order.action = 'BUY'
+    order.orderType = 'MKT'
+    order.totalQuantity = new Decimal(10)
+    await b.placeOrder(contract, order)
+
+    // Effective price = 100 × (1 + 0.001) = 100.10
+    // Cash = 100_000 - 10 × 100.10 = 100_000 - 1001 = 98_999
+    const account = await b.getAccount()
+    expect(account.totalCashValue).toBe('98999')
+  })
+
+  it('SELLs fill below quoted price by slippageBps', async () => {
+    const b = new MockBroker({ cash: 100_000, slippageBps: 10 })
+    b.setQuote('AAPL', 100)
+    const contract = makeContract({ aliceId: 'mock-paper|AAPL', symbol: 'AAPL' })
+
+    const buy = new Order()
+    buy.action = 'BUY'
+    buy.orderType = 'MKT'
+    buy.totalQuantity = new Decimal(10)
+    await b.placeOrder(contract, buy)
+    const cashAfterBuy = (await b.getAccount()).totalCashValue
+    expect(cashAfterBuy).toBe('98999')  // 100_000 - 10×100.10
+
+    const sell = new Order()
+    sell.action = 'SELL'
+    sell.orderType = 'MKT'
+    sell.totalQuantity = new Decimal(10)
+    await b.placeOrder(contract, sell)
+    // Effective price = 100 × (1 - 0.001) = 99.90
+    // Cash = 98_999 + 10 × 99.90 = 98_999 + 999 = 99_998
+    const account = await b.getAccount()
+    expect(account.totalCashValue).toBe('99998')
+  })
+})
+
+// ==================== Deferred market fills ====================
+
+describe('deferMarketFills', () => {
+  it('keeps market orders pending instead of filling immediately', async () => {
+    const b = new MockBroker({ cash: 100_000, deferMarketFills: true })
+    b.setQuote('AAPL', 100)
+    const contract = makeContract({ aliceId: 'mock-paper|AAPL', symbol: 'AAPL' })
+    const order = new Order()
+    order.action = 'BUY'
+    order.orderType = 'MKT'
+    order.totalQuantity = new Decimal(10)
+    const result = await b.placeOrder(contract, order)
+
+    expect(result.orderState?.status).toBe('Submitted')
+    // Cash and positions unchanged
+    const account = await b.getAccount()
+    expect(account.totalCashValue).toBe('100000')
+    expect(await b.getPositions()).toHaveLength(0)
+  })
+
+  it('flushPendingMarketOrders fills all pending markets at current quote', async () => {
+    const b = new MockBroker({ cash: 100_000, deferMarketFills: true })
+    b.setQuote('AAPL', 100)
+    const contract = makeContract({ aliceId: 'mock-paper|AAPL', symbol: 'AAPL' })
+    const order = new Order()
+    order.action = 'BUY'
+    order.orderType = 'MKT'
+    order.totalQuantity = new Decimal(10)
+    await b.placeOrder(contract, order)
+
+    // Quote moves before flush — fills happen at the new quote
+    b.setQuote('AAPL', 105)
+    const filled = b.flushPendingMarketOrders()
+    expect(filled).toBe(1)
+
+    // Cash = 100_000 - 10 × 105 = 98_950
+    const account = await b.getAccount()
+    expect(account.totalCashValue).toBe('98950')
+    expect(await b.getPositions()).toHaveLength(1)
+  })
+
+  it('does not flush pending limit orders', async () => {
+    const b = new MockBroker({ cash: 100_000, deferMarketFills: true })
+    b.setQuote('AAPL', 100)
+    const contract = makeContract({ aliceId: 'mock-paper|AAPL', symbol: 'AAPL' })
+    const limit = new Order()
+    limit.action = 'BUY'
+    limit.orderType = 'LMT'
+    limit.totalQuantity = new Decimal(10)
+    limit.lmtPrice = new Decimal(95)
+    await b.placeOrder(contract, limit)
+
+    const filled = b.flushPendingMarketOrders()
+    expect(filled).toBe(0)
+    // Limit still pending
+    const account = await b.getAccount()
+    expect(account.totalCashValue).toBe('100000')
+  })
+
+  it('flushPendingMarketOrders applies commission + slippage', async () => {
+    const b = new MockBroker({
+      cash: 100_000,
+      deferMarketFills: true,
+      commissionPerShare: 0.005,
+      commissionMin: 1,
+      slippageBps: 10,
+    })
+    b.setQuote('AAPL', 100)
+    const contract = makeContract({ aliceId: 'mock-paper|AAPL', symbol: 'AAPL' })
+    const order = new Order()
+    order.action = 'BUY'
+    order.orderType = 'MKT'
+    order.totalQuantity = new Decimal(100)
+    await b.placeOrder(contract, order)
+
+    b.flushPendingMarketOrders()
+
+    // Effective price = 100 × 1.001 = 100.10
+    // Gross = 100 × 100.10 = 10_010
+    // Commission = max(100 × 0.005, 1) = 0.5 — no, 100×0.005=0.5, max(0.5,1)=1.
+    // Cash = 100_000 - 10_010 - 1 = 89_989
+    const account = await b.getAccount()
+    expect(account.totalCashValue).toBe('89989')
+    expect(b.totalCommissionsPaid).toBe('1')
+  })
+})

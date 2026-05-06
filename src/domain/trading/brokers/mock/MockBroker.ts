@@ -54,6 +54,29 @@ export interface MockBrokerOptions {
   label?: string
   cash?: number
   accountInfo?: Partial<AccountInfo>
+  /**
+   * Per-share commission charged on every fill (BUY or SELL). Default 0.
+   * Subject to `commissionMin` floor. IBKR Pro reference: $0.005/share.
+   */
+  commissionPerShare?: number
+  /**
+   * Minimum commission per fill, applied if qty × commissionPerShare
+   * is less than this value. Default 0. IBKR Pro reference: $1.00.
+   */
+  commissionMin?: number
+  /**
+   * Slippage in basis points (1 bp = 0.01%). BUYs fill above the
+   * quote, SELLs fill below. Default 0.
+   */
+  slippageBps?: number
+  /**
+   * When true, market orders go to pending instead of filling
+   * immediately. Caller (e.g. BacktestEngine) drives fills via
+   * `flushPendingMarketOrders()` after advancing the quote — this
+   * is how next-bar-open fill is implemented without a look-ahead
+   * gap. Default false (legacy immediate-fill behaviour).
+   */
+  deferMarketFills?: boolean
 }
 
 // ==================== Defaults ====================
@@ -150,16 +173,32 @@ export class MockBroker implements IBroker {
   private _callLog: CallRecord[] = []
   private _failRemaining = 0
 
+  // Fill model — defaults preserve legacy behaviour (no friction, immediate fills).
+  private readonly _commissionPerShare: Decimal
+  private readonly _commissionMin: Decimal
+  private readonly _slippageBps: Decimal
+  private readonly _deferMarketFills: boolean
+  private _totalCommissionsPaid = new Decimal(0)
+
   constructor(options: MockBrokerOptions = {}) {
     this.id = options.id ?? 'mock-paper'
     this.label = options.label ?? 'Mock Paper Account'
     this._cash = new Decimal(options.cash ?? 100_000)
+    this._commissionPerShare = new Decimal(options.commissionPerShare ?? 0)
+    this._commissionMin = new Decimal(options.commissionMin ?? 0)
+    this._slippageBps = new Decimal(options.slippageBps ?? 0)
+    this._deferMarketFills = options.deferMarketFills ?? false
     if (options.accountInfo) {
       this._accountOverride = {
         baseCurrency: 'USD', netLiquidation: '0', totalCashValue: '0', unrealizedPnL: '0', realizedPnL: '0',
         ...options.accountInfo,
       }
     }
+  }
+
+  /** Total commissions charged so far. Diagnostic. */
+  get totalCommissionsPaid(): string {
+    return this._totalCommissionsPaid.toString()
   }
 
   // ==================== Call tracking ====================
@@ -226,35 +265,25 @@ export class MockBroker implements IBroker {
     const isMarket = order.orderType === 'MKT'
     const side = order.action.toUpperCase()
     const qty = !order.totalQuantity.equals(UNSET_DECIMAL) ? order.totalQuantity : new Decimal(0)
-    const symbol = contract.aliceId ?? contract.symbol ?? 'unknown'
 
-    if (isMarket) {
+    if (isMarket && !this._deferMarketFills) {
       const price = this._quotes.get(contract.symbol ?? '') ?? 100
+      this._executeFill(contract, side, qty, new Decimal(price))
 
-      // Update position
-      this._applyFill(contract, side, qty, new Decimal(price))
-
-      // Update cash
-      const cost = qty.mul(price)
-      this._cash = side === 'BUY' ? this._cash.minus(cost) : this._cash.plus(cost)
-
-      // Record order as filled
       const filledOrder = this._cloneOrder(order, orderId)
       this._orders.set(orderId, {
         id: orderId, contract, order: filledOrder,
         status: 'Filled', fillPrice: price,
       })
 
-      // Return submitted — actual fill status discovered via getOrder/sync
-      // (MockBroker executes internally but doesn't expose execution in response,
-      // matching real exchange async behavior)
       const orderState = new OrderState()
       orderState.status = 'Filled'
-
       return { success: true, orderId, orderState }
     }
 
-    // Limit/stop order → pending
+    // Either a limit/stop order, or a market order in deferred mode →
+    // both go to pending. Deferred market orders are flushed by the
+    // engine via flushPendingMarketOrders() after advancing the quote.
     const pendingOrder = this._cloneOrder(order, orderId)
     this._orders.set(orderId, {
       id: orderId, contract, order: pendingOrder, status: 'Submitted',
@@ -434,19 +463,45 @@ export class MockBroker implements IBroker {
     this._quotes.set(symbol, price)
   }
 
-  /** Manually fill a pending limit order at the given price. */
+  /** Manually fill a pending order at the given price. Used by tests. */
   fillPendingOrder(orderId: string, price: number): void {
     const internal = this._orders.get(orderId)
     if (!internal || internal.status !== 'Submitted') return
-    internal.status = 'Filled'
-    internal.fillPrice = price
-
     const qty = internal.order.totalQuantity
     const side = internal.order.action.toUpperCase()
-    this._applyFill(internal.contract, side, qty, new Decimal(price))
+    this._executeFill(internal.contract, side, qty, new Decimal(price))
+    internal.status = 'Filled'
+    internal.fillPrice = price
+  }
 
-    const cost = qty.mul(price)
-    this._cash = side === 'BUY' ? this._cash.minus(cost) : this._cash.plus(cost)
+  /**
+   * Fill all pending MARKET orders at each contract's current quote.
+   * Used by the BacktestEngine after advancing the quote to the next
+   * bar's open: orders the strategy placed on the previous bar's
+   * close are realised here without look-ahead bias.
+   *
+   * Limit / stop orders are not touched — they wait for a real
+   * cross or for `fillPendingOrder` to be called explicitly.
+   *
+   * Returns the number of orders filled.
+   */
+  flushPendingMarketOrders(): number {
+    let filled = 0
+    for (const internal of this._orders.values()) {
+      if (internal.status !== 'Submitted') continue
+      if (internal.order.orderType !== 'MKT') continue
+
+      const symbol = internal.contract.symbol ?? ''
+      const price = this._quotes.get(symbol) ?? 100
+      const qty = internal.order.totalQuantity
+      const side = internal.order.action.toUpperCase()
+
+      this._executeFill(internal.contract, side, qty, new Decimal(price))
+      internal.status = 'Filled'
+      internal.fillPrice = price
+      filled++
+    }
+    return filled
   }
 
   /** Override positions directly (for legacy test compatibility). */
@@ -496,6 +551,32 @@ export class MockBroker implements IBroker {
   }
 
   // ==================== Internal ====================
+
+  /**
+   * Realise a fill end-to-end: apply slippage to the price, update
+   * the position, deduct/add cash, charge commission. Single entry
+   * point so that placeOrder (immediate fill), fillPendingOrder
+   * (manual limit fill), and flushPendingMarketOrders (deferred
+   * market fill) all behave identically.
+   */
+  private _executeFill(contract: Contract, side: string, qty: Decimal, marketPrice: Decimal): void {
+    const slippageFactor = this._slippageBps.div(10_000)
+    const effectivePrice = side === 'BUY'
+      ? marketPrice.mul(new Decimal(1).plus(slippageFactor))
+      : marketPrice.mul(new Decimal(1).minus(slippageFactor))
+
+    this._applyFill(contract, side, qty, effectivePrice)
+
+    const gross = qty.mul(effectivePrice)
+    const commission = Decimal.max(qty.mul(this._commissionPerShare), this._commissionMin)
+    this._totalCommissionsPaid = this._totalCommissionsPaid.plus(commission)
+
+    if (side === 'BUY') {
+      this._cash = this._cash.minus(gross).minus(commission)
+    } else {
+      this._cash = this._cash.plus(gross).minus(commission)
+    }
+  }
 
   private _applyFill(contract: Contract, side: string, qty: Decimal, price: Decimal): void {
     const key = contract.aliceId ?? contract.symbol ?? 'unknown'

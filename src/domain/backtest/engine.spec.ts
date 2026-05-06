@@ -166,6 +166,103 @@ describe('runBacktest long-only', () => {
   })
 })
 
+// ==================== Deferred market fill (look-ahead elimination) ====================
+
+describe('runBacktest with deferMarketFills broker', () => {
+  it('fills market orders at next-bar OPEN, not same-bar close', async () => {
+    const broker = new MockBroker({ cash: 10_000, deferMarketFills: true })
+
+    // Bar 0: open 100, close 110.
+    // Bar 1: open 200, close 210.
+    // Bar 2: open 300, close 310.
+    // If strategy buys on bar 0 (sees close 110) and fill happens at
+    // bar 0 close (look-ahead) → cost would be 110 × 10 = 1100.
+    // With next-bar fill → cost is bar 1 open 200 × 10 = 2000.
+    const bars: Bar[] = [
+      { ts: new Date('2024-01-01T00:00:00Z'), open: '100', high: '120', low: '90',  close: '110', volume: '1000' },
+      { ts: new Date('2024-01-02T00:00:00Z'), open: '200', high: '220', low: '190', close: '210', volume: '1000' },
+      { ts: new Date('2024-01-03T00:00:00Z'), open: '300', high: '320', low: '290', close: '310', volume: '1000' },
+    ]
+
+    const report = await runBacktest(
+      { symbol: 'AAPL', bars, initialCash: 10_000, strategy: buyOnceStrategy(10) },
+      broker,
+    )
+
+    // Bar 0: order pending, no fill. Equity = cash 10_000.
+    expect(report.equityCurve[0].equity).toBe('10000')
+
+    // Bar 1: pending market fills at open 200 → cash 10_000 - 2000 = 8000.
+    // Mark-to-market at close 210: equity = 8000 + 10×210 = 10_100.
+    expect(report.equityCurve[1].equity).toBe('10100')
+
+    // Bar 2: no new orders. Open 300, close 310:
+    // equity = 8000 + 10×310 = 11_100.
+    expect(report.equityCurve[2].equity).toBe('11100')
+  })
+
+  it('strands orders placed on the final bar (no next bar to flush)', async () => {
+    const broker = new MockBroker({ cash: 10_000, deferMarketFills: true })
+    const bars: Bar[] = [
+      { ts: new Date('2024-01-01T00:00:00Z'), open: '100', high: '110', low: '90',  close: '100', volume: '1000' },
+      { ts: new Date('2024-01-02T00:00:00Z'), open: '100', high: '110', low: '90',  close: '100', volume: '1000' },
+    ]
+
+    // Strategy buys ONLY on the last bar (index 1 in this 2-bar test).
+    const lastBarBuy: Strategy = async ({ broker, symbol, index }) => {
+      if (index !== 1) return
+      const contract = makeContract({ symbol, aliceId: `mock-paper|${symbol}` })
+      const order = new Order()
+      order.action = 'BUY'
+      order.orderType = 'MKT'
+      order.totalQuantity = new Decimal(10)
+      order.lmtPrice = UNSET_DECIMAL
+      order.auxPrice = UNSET_DECIMAL
+      order.trailStopPrice = UNSET_DECIMAL
+      order.trailingPercent = UNSET_DECIMAL
+      order.cashQty = UNSET_DECIMAL
+      await broker.placeOrder(contract, order)
+    }
+
+    const report = await runBacktest(
+      { symbol: 'AAPL', bars, initialCash: 10_000, strategy: lastBarBuy },
+      broker,
+    )
+
+    // tradeCount counts placeOrder calls, not fills — so the stranded
+    // order shows up here. Equity stays at initial cash because the
+    // order never executed.
+    expect(report.tradeCount).toBe(1)
+    expect(report.equityCurve[1].equity).toBe('10000')
+  })
+
+  it('charges commission + slippage through the engine path', async () => {
+    const broker = new MockBroker({
+      cash: 10_000,
+      deferMarketFills: true,
+      commissionPerShare: 0.005,
+      commissionMin: 1,
+      slippageBps: 10, // 0.10%
+    })
+    const bars: Bar[] = [
+      { ts: new Date('2024-01-01T00:00:00Z'), open: '100', high: '110', low: '90',  close: '100', volume: '1000' },
+      { ts: new Date('2024-01-02T00:00:00Z'), open: '100', high: '110', low: '90',  close: '100', volume: '1000' },
+    ]
+
+    await runBacktest(
+      { symbol: 'AAPL', bars, initialCash: 10_000, strategy: buyOnceStrategy(10) },
+      broker,
+    )
+
+    // Effective price = 100 × (1 + 0.001) = 100.10.
+    // Gross = 10 × 100.10 = 1001. Commission = max(10×0.005, 1) = 1.
+    // Cash after fill = 10_000 - 1001 - 1 = 8_998.
+    const account = await broker.getAccount()
+    expect(account.totalCashValue).toBe('8998')
+    expect(broker.totalCommissionsPaid).toBe('1')
+  })
+})
+
 // ==================== Quote injection ====================
 
 describe('runBacktest quote handling', () => {
