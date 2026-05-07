@@ -6,6 +6,7 @@ import { CooldownGuard } from './cooldown.js'
 import { SymbolWhitelistGuard } from './symbol-whitelist.js'
 import { PerTradeLossCapGuard } from './per-trade-loss-cap.js'
 import { MaxPositionsGuard } from './max-positions.js'
+import { DailyLossCapGuard } from './daily-loss-cap.js'
 import { createGuardPipeline } from './guard-pipeline.js'
 import { resolveGuards, registerGuard } from './registry.js'
 import type { GuardContext, OperationGuard } from './types.js'
@@ -614,5 +615,181 @@ describe('MaxPositionsGuard', () => {
   it('throws on construction with invalid max', () => {
     expect(() => new MaxPositionsGuard({ max: 0 })).toThrow(/positive integer/)
     expect(() => new MaxPositionsGuard({ max: -1 })).toThrow(/positive integer/)
+  })
+})
+
+// ==================== DailyLossCapGuard ====================
+
+describe('DailyLossCapGuard', () => {
+  // Use UTC timezone in tests so dateKey math is predictable.
+  // Production default is America/New_York; the guard handles it
+  // identically — only the boundary moves.
+  function makeGuard(opts: {
+    cap?: number
+    nowMs?: number
+    nowFn?: () => number
+  } = {}) {
+    let nowMs = opts.nowMs ?? Date.UTC(2024, 5, 15, 14, 0, 0) // 2024-06-15 14:00 UTC
+    return new DailyLossCapGuard({
+      maxPercentOfEquity: opts.cap ?? 2,
+      timezone: 'UTC',
+      now: opts.nowFn ?? (() => nowMs),
+      // setter for tests that need to advance time
+      ...({} as Record<string, never>),
+    })
+  }
+
+  it('allows the very first entry of the day (anchor capture)', async () => {
+    const guard = makeGuard()
+    const ctx = makeContext({
+      operation: makePlaceOrderOp({ totalQuantity: new Decimal(10), lmtPrice: 100 }),
+      account: { netLiquidation: '100000' },
+    })
+    expect(await guard.check(ctx)).toBeNull()
+  })
+
+  it('allows subsequent entries while still under the cap', async () => {
+    const guard = makeGuard({ cap: 2 })
+    // First call captures anchor at 100k.
+    await guard.check(makeContext({
+      operation: makePlaceOrderOp({ totalQuantity: new Decimal(10) }),
+      account: { netLiquidation: '100000' },
+    }))
+    // Now equity dropped 1.5% — still under 2% cap.
+    const result = await guard.check(makeContext({
+      operation: makePlaceOrderOp({ totalQuantity: new Decimal(10) }),
+      account: { netLiquidation: '98500' },
+    }))
+    expect(result).toBeNull()
+  })
+
+  it('rejects new entries once today P&L breaches -cap', async () => {
+    const guard = makeGuard({ cap: 2 })
+    await guard.check(makeContext({
+      operation: makePlaceOrderOp({ totalQuantity: new Decimal(10) }),
+      account: { netLiquidation: '100000' },
+    }))
+    // Equity dropped 2.5% — over cap.
+    const result = await guard.check(makeContext({
+      operation: makePlaceOrderOp({ totalQuantity: new Decimal(10) }),
+      account: { netLiquidation: '97500' },
+    }))
+    expect(result).toContain('Daily loss cap hit')
+    expect(result).toContain('-2.50%')
+    expect(result).toContain('-2%')
+  })
+
+  it('resets the anchor when the calendar day rolls over', async () => {
+    let nowMs = Date.UTC(2024, 5, 15, 14, 0, 0)
+    const guard = new DailyLossCapGuard({
+      maxPercentOfEquity: 2,
+      timezone: 'UTC',
+      now: () => nowMs,
+    })
+
+    // Day 1: anchor at 100k, then drops 3% (over cap).
+    await guard.check(makeContext({
+      operation: makePlaceOrderOp({ totalQuantity: new Decimal(10) }),
+      account: { netLiquidation: '100000' },
+    }))
+    const blocked = await guard.check(makeContext({
+      operation: makePlaceOrderOp({ totalQuantity: new Decimal(10) }),
+      account: { netLiquidation: '97000' },
+    }))
+    expect(blocked).toContain('Daily loss cap hit')
+
+    // Advance to next UTC day.
+    nowMs = Date.UTC(2024, 5, 16, 14, 0, 0)
+
+    // First check on day 2 → should reset anchor and allow.
+    const allowed = await guard.check(makeContext({
+      operation: makePlaceOrderOp({ totalQuantity: new Decimal(10) }),
+      account: { netLiquidation: '97000' },
+    }))
+    expect(allowed).toBeNull()
+  })
+
+  it('does NOT cap SELL exits even when over the limit', async () => {
+    const guard = makeGuard({ cap: 2 })
+    await guard.check(makeContext({
+      operation: makePlaceOrderOp({ totalQuantity: new Decimal(10) }),
+      account: { netLiquidation: '100000' },
+    }))
+    // Way over cap, but a SELL must always be allowed (otherwise
+    // stops can't fire and losses spiral).
+    const result = await guard.check(makeContext({
+      operation: makePlaceOrderOp({
+        action: 'SELL',
+        totalQuantity: new Decimal(10),
+      }),
+      account: { netLiquidation: '90000' },
+    }))
+    expect(result).toBeNull()
+  })
+
+  it('skips non-placeOrder operations', async () => {
+    const guard = makeGuard()
+    const ctx = makeContext({
+      operation: { action: 'closePosition', contract: makeContract({ symbol: 'AAPL' }) },
+    })
+    expect(await guard.check(ctx)).toBeNull()
+  })
+
+  it('skips when netLiquidation is zero or negative', async () => {
+    const guard = makeGuard()
+    const ctx = makeContext({
+      operation: makePlaceOrderOp({ totalQuantity: new Decimal(10) }),
+      account: { netLiquidation: '0' },
+    })
+    expect(await guard.check(ctx)).toBeNull()
+  })
+
+  it('persists anchor across instances when accountId is set', async () => {
+    const { mkdtemp, rm } = await import('fs/promises')
+    const { tmpdir } = await import('os')
+    const { join } = await import('path')
+    const tmpRoot = await mkdtemp(join(tmpdir(), 'daily-cap-test-'))
+    const cwdSpy = vi.spyOn(process, 'cwd').mockReturnValue(tmpRoot)
+
+    try {
+      const accountId = 'test-uta'
+      const nowMs = Date.UTC(2024, 5, 15, 14, 0, 0)
+
+      // Instance 1: capture anchor at 100k.
+      const g1 = new DailyLossCapGuard({
+        maxPercentOfEquity: 2,
+        timezone: 'UTC',
+        accountId,
+        now: () => nowMs,
+      })
+      await g1.check(makeContext({
+        operation: makePlaceOrderOp({ totalQuantity: new Decimal(10) }),
+        account: { netLiquidation: '100000' },
+      }))
+      // Wait for fire-and-forget persist to flush.
+      await new Promise(r => setTimeout(r, 30))
+
+      // Instance 2 (simulates restart, same UTC day): equity dropped
+      // 3% — must reject because anchor came back from disk.
+      const g2 = new DailyLossCapGuard({
+        maxPercentOfEquity: 2,
+        timezone: 'UTC',
+        accountId,
+        now: () => nowMs,
+      })
+      const result = await g2.check(makeContext({
+        operation: makePlaceOrderOp({ totalQuantity: new Decimal(10) }),
+        account: { netLiquidation: '97000' },
+      }))
+      expect(result).toContain('Daily loss cap hit')
+    } finally {
+      cwdSpy.mockRestore()
+      await rm(tmpRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('throws on construction with invalid maxPercentOfEquity', () => {
+    expect(() => new DailyLossCapGuard({ maxPercentOfEquity: 0 })).toThrow(/positive number/)
+    expect(() => new DailyLossCapGuard({ maxPercentOfEquity: -1 })).toThrow(/positive number/)
   })
 })
