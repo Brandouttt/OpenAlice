@@ -414,6 +414,18 @@ export class TradingGit implements ITradingGit {
     this.persistAsync()
   }
 
+  /**
+   * Return the most recent commits as full GitCommit objects, newest
+   * first. `limit <= 0` returns empty. Returns a shallow copy so
+   * callers can't mutate the internal log; nested objects are not
+   * cloned (callers treat them as read-only).
+   */
+  recentCommits(limit: number): GitCommit[] {
+    if (!Number.isFinite(limit) || limit <= 0) return []
+    const start = Math.max(0, this.commits.length - limit)
+    return this.commits.slice(start).reverse()
+  }
+
   // ==================== Sync ====================
 
   async sync(updates: OrderStatusUpdate[], currentState: GitState): Promise<SyncResult> {

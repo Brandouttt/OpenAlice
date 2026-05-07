@@ -37,6 +37,13 @@ export interface ITradingGit {
   show(hash: CommitHash): GitCommit | null
   status(): GitStatus
 
+  /**
+   * Most recent commits as full GitCommit objects (newest first).
+   * Differs from `log()` which returns lighter CommitLogEntry summaries.
+   * Used by guards that need per-commit P&L (stateAfter.realizedPnL).
+   */
+  recentCommits(limit: number): GitCommit[]
+
   // ---- git pull (sync pending orders) ----
 
   sync(updates: OrderStatusUpdate[], currentState: GitState): Promise<SyncResult>

@@ -7,6 +7,8 @@ import { SymbolWhitelistGuard } from './symbol-whitelist.js'
 import { PerTradeLossCapGuard } from './per-trade-loss-cap.js'
 import { MaxPositionsGuard } from './max-positions.js'
 import { DailyLossCapGuard } from './daily-loss-cap.js'
+import { CircuitBreakerGuard, countConsecutiveLosses } from './circuit-breaker.js'
+import type { GitCommit } from '../git/types.js'
 import { createGuardPipeline } from './guard-pipeline.js'
 import { resolveGuards, registerGuard } from './registry.js'
 import type { GuardContext, OperationGuard } from './types.js'
@@ -48,6 +50,7 @@ function makeContext(overrides: {
   operation?: Operation
   positions?: Position[]
   account?: Partial<AccountInfo>
+  recentCommits?: GuardContext['recentCommits']
 } = {}): GuardContext {
   return {
     operation: overrides.operation ?? makePlaceOrderOp(),
@@ -60,6 +63,7 @@ function makeContext(overrides: {
       realizedPnL: '0',
       ...overrides.account,
     },
+    recentCommits: overrides.recentCommits ?? [],
   }
 }
 
@@ -791,5 +795,215 @@ describe('DailyLossCapGuard', () => {
   it('throws on construction with invalid maxPercentOfEquity', () => {
     expect(() => new DailyLossCapGuard({ maxPercentOfEquity: 0 })).toThrow(/positive number/)
     expect(() => new DailyLossCapGuard({ maxPercentOfEquity: -1 })).toThrow(/positive number/)
+  })
+})
+
+// ==================== CircuitBreakerGuard ====================
+
+describe('countConsecutiveLosses helper', () => {
+  function commit(realizedPnL: string): GitCommit {
+    // Minimal GitCommit shape — only stateAfter.realizedPnL is read.
+    return {
+      hash: 'h',
+      parentHash: null,
+      message: '',
+      operations: [],
+      results: [],
+      stateAfter: {
+        netLiquidation: '0',
+        totalCashValue: '0',
+        unrealizedPnL: '0',
+        realizedPnL,
+        positions: [],
+        pendingOrders: [],
+      },
+      timestamp: '',
+    }
+  }
+
+  it('returns 0 for empty log', () => {
+    expect(countConsecutiveLosses([])).toBe(0)
+  })
+
+  it('returns 0 for a single commit (no previous to compare)', () => {
+    expect(countConsecutiveLosses([commit('100')])).toBe(0)
+  })
+
+  it('counts a single losing close', () => {
+    // Newest commit has lower realized PnL than previous → 1 loss.
+    expect(countConsecutiveLosses([commit('80'), commit('100')])).toBe(1)
+  })
+
+  it('counts multiple consecutive losses', () => {
+    // Newest first: 70 → 80 → 90 → 100 = 3 consecutive drops.
+    expect(countConsecutiveLosses([
+      commit('70'), commit('80'), commit('90'), commit('100'),
+    ])).toBe(3)
+  })
+
+  it('breaks the streak on a winning close', () => {
+    // Newest first: 70 (loss) → 80 (loss) → 100 (WIN) → 50 (no count, streak already broken)
+    expect(countConsecutiveLosses([
+      commit('70'), commit('80'), commit('100'), commit('50'),
+    ])).toBe(2)
+  })
+
+  it('skips zero-delta commits without breaking the streak', () => {
+    // Open-only / sync commits don't change realizedPnL — they
+    // should neither count nor reset the streak.
+    expect(countConsecutiveLosses([
+      commit('70'), commit('80'), commit('80'), commit('100'),
+    ])).toBe(2)
+  })
+})
+
+describe('CircuitBreakerGuard', () => {
+  function commit(realizedPnL: string): GitCommit {
+    return {
+      hash: 'h',
+      parentHash: null,
+      message: '',
+      operations: [],
+      results: [],
+      stateAfter: {
+        netLiquidation: '0',
+        totalCashValue: '0',
+        unrealizedPnL: '0',
+        realizedPnL,
+        positions: [],
+        pendingOrders: [],
+      },
+      timestamp: '',
+    }
+  }
+
+  it('allows entry when no losses', async () => {
+    const guard = new CircuitBreakerGuard({ maxConsecutiveLosses: 5 })
+    const ctx = makeContext({ recentCommits: [] })
+    expect(await guard.check(ctx)).toBeNull()
+  })
+
+  it('allows entry when consecutive loss count is below threshold', async () => {
+    const guard = new CircuitBreakerGuard({ maxConsecutiveLosses: 5 })
+    // 3 consecutive losses, threshold 5 → still under.
+    const commits = [commit('70'), commit('80'), commit('90'), commit('100')]
+    expect(await guard.check(makeContext({ recentCommits: commits }))).toBeNull()
+  })
+
+  it('trips and rejects when consecutive losses hit the threshold', async () => {
+    const guard = new CircuitBreakerGuard({ maxConsecutiveLosses: 3 })
+    // Exactly 3 losses → triggers.
+    const commits = [commit('70'), commit('80'), commit('90'), commit('100')]
+    const result = await guard.check(makeContext({ recentCommits: commits }))
+    expect(result).toContain('Circuit breaker triggered')
+    expect(result).toContain('3 consecutive losses')
+  })
+
+  it('blocks subsequent entries during cooldown without re-evaluating', async () => {
+    let nowMs = 1_000_000
+    const guard = new CircuitBreakerGuard({
+      maxConsecutiveLosses: 3,
+      cooldownMinutes: 60,
+      now: () => nowMs,
+    })
+    const commits = [commit('70'), commit('80'), commit('90'), commit('100')]
+
+    // First trip
+    const trip = await guard.check(makeContext({ recentCommits: commits }))
+    expect(trip).toContain('Circuit breaker triggered')
+
+    // 30 minutes later — still in cooldown
+    nowMs += 30 * 60_000
+    const blocked = await guard.check(makeContext({ recentCommits: commits }))
+    expect(blocked).toContain('Circuit breaker tripped')
+    expect(blocked).toContain('30min cooldown remaining')
+  })
+
+  it('clears the trip after cooldown expires and re-evaluates', async () => {
+    let nowMs = 1_000_000
+    const guard = new CircuitBreakerGuard({
+      maxConsecutiveLosses: 3,
+      cooldownMinutes: 60,
+      now: () => nowMs,
+    })
+    const lossyCommits = [commit('70'), commit('80'), commit('90'), commit('100')]
+    await guard.check(makeContext({ recentCommits: lossyCommits })) // trip
+
+    // 61 minutes later — cooldown done. With a winning commit at the
+    // top, the breaker should clear and allow new entries.
+    nowMs += 61 * 60_000
+    const winningCommits = [commit('200'), commit('70'), commit('80'), commit('90'), commit('100')]
+    expect(await guard.check(makeContext({ recentCommits: winningCommits }))).toBeNull()
+  })
+
+  it('does NOT block SELL exits even when tripped', async () => {
+    const guard = new CircuitBreakerGuard({ maxConsecutiveLosses: 3 })
+    const commits = [commit('70'), commit('80'), commit('90'), commit('100')]
+    await guard.check(makeContext({ recentCommits: commits })) // trip via a BUY check
+    const result = await guard.check(makeContext({
+      operation: makePlaceOrderOp({ action: 'SELL', totalQuantity: new Decimal(10) }),
+      recentCommits: commits,
+    }))
+    expect(result).toBeNull()
+  })
+
+  it('skips non-placeOrder operations', async () => {
+    const guard = new CircuitBreakerGuard({ maxConsecutiveLosses: 1 })
+    const commits = [commit('70'), commit('100')] // 1 loss, would trip if BUY
+    const ctx = makeContext({
+      operation: { action: 'closePosition', contract: makeContract({ symbol: 'AAPL' }) },
+      recentCommits: commits,
+    })
+    expect(await guard.check(ctx)).toBeNull()
+  })
+
+  it('persists the trip across instances', async () => {
+    const { mkdtemp, rm } = await import('fs/promises')
+    const { tmpdir } = await import('os')
+    const { join } = await import('path')
+    const tmpRoot = await mkdtemp(join(tmpdir(), 'cb-test-'))
+    const cwdSpy = vi.spyOn(process, 'cwd').mockReturnValue(tmpRoot)
+
+    try {
+      const accountId = 'test-uta'
+      const nowMs = 1_000_000
+      const lossyCommits = [commit('70'), commit('80'), commit('90'), commit('100')]
+
+      // Instance 1 — trip the breaker.
+      const g1 = new CircuitBreakerGuard({
+        maxConsecutiveLosses: 3,
+        cooldownMinutes: 60,
+        accountId,
+        now: () => nowMs,
+      })
+      const trip = await g1.check(makeContext({ recentCommits: lossyCommits }))
+      expect(trip).toContain('Circuit breaker triggered')
+      // Wait for fire-and-forget persist to flush.
+      await new Promise(r => setTimeout(r, 30))
+
+      // Instance 2 (simulated restart, 30 min later) — must still be
+      // in cooldown.
+      const g2 = new CircuitBreakerGuard({
+        maxConsecutiveLosses: 3,
+        cooldownMinutes: 60,
+        accountId,
+        now: () => nowMs + 30 * 60_000,
+      })
+      const blocked = await g2.check(makeContext({ recentCommits: lossyCommits }))
+      expect(blocked).toContain('Circuit breaker tripped')
+    } finally {
+      cwdSpy.mockRestore()
+      await rm(tmpRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('throws on construction with invalid maxConsecutiveLosses', () => {
+    expect(() => new CircuitBreakerGuard({ maxConsecutiveLosses: 0 })).toThrow(/positive integer/)
+    expect(() => new CircuitBreakerGuard({ maxConsecutiveLosses: -1 })).toThrow(/positive integer/)
+  })
+
+  it('throws on construction with invalid cooldownMinutes', () => {
+    expect(() => new CircuitBreakerGuard({ cooldownMinutes: 0 })).toThrow(/positive number/)
+    expect(() => new CircuitBreakerGuard({ cooldownMinutes: -1 })).toThrow(/positive number/)
   })
 })

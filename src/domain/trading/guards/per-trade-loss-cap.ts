@@ -22,7 +22,7 @@
  */
 
 import Decimal from 'decimal.js'
-import { UNSET_DECIMAL } from '@traderalice/ibkr'
+import { Order, UNSET_DECIMAL } from '@traderalice/ibkr'
 import type { OperationGuard, GuardContext } from './types.js'
 
 const DEFAULT_MAX_PERCENT = 1 // 1% per trade — Mark Minervini / O'Neil baseline
@@ -98,7 +98,7 @@ export class PerTradeLossCapGuard implements OperationGuard {
    * order). String → Decimal conversion is centralised here.
    */
   private estimateEntry(
-    order: GuardContext['operation'] extends { action: 'placeOrder'; order: infer O } ? O : never,
+    order: Order,
     symbol: string,
     positions: GuardContext['positions'],
   ): Decimal | null {

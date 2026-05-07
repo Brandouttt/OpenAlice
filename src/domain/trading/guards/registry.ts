@@ -5,6 +5,7 @@ import { SymbolWhitelistGuard } from './symbol-whitelist.js'
 import { PerTradeLossCapGuard } from './per-trade-loss-cap.js'
 import { MaxPositionsGuard } from './max-positions.js'
 import { DailyLossCapGuard } from './daily-loss-cap.js'
+import { CircuitBreakerGuard } from './circuit-breaker.js'
 
 const builtinGuards: GuardRegistryEntry[] = [
   { type: 'max-position-size',   create: (opts) => new MaxPositionSizeGuard(opts) },
@@ -13,6 +14,7 @@ const builtinGuards: GuardRegistryEntry[] = [
   { type: 'per-trade-loss-cap',  create: (opts) => new PerTradeLossCapGuard(opts) },
   { type: 'max-positions',       create: (opts) => new MaxPositionsGuard(opts) },
   { type: 'daily-loss-cap',      create: (opts) => new DailyLossCapGuard(opts) },
+  { type: 'circuit-breaker',     create: (opts) => new CircuitBreakerGuard(opts) },
 ]
 
 const registry = new Map<string, GuardRegistryEntry['create']>(

@@ -163,7 +163,12 @@ export class UnifiedTradingAccount {
       }
     }
     const guards = resolveGuards(options.guards ?? [], { accountId: broker.id })
-    const guardedDispatcher = createGuardPipeline(dispatcher, broker, guards)
+    const guardedDispatcher = createGuardPipeline(dispatcher, broker, guards, {
+      // Lazy closure — at construction time `this.git` is not yet
+      // assigned, but by the time the dispatcher is invoked the git
+      // instance below has been wired up.
+      recentCommits: () => this.git.recentCommits(20),
+    })
 
     const gitConfig = {
       executeOperation: guardedDispatcher,
