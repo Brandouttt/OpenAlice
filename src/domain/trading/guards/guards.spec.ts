@@ -4,6 +4,7 @@ import { Contract, Order, UNSET_DECIMAL } from '@traderalice/ibkr'
 import { MaxPositionSizeGuard } from './max-position-size.js'
 import { CooldownGuard } from './cooldown.js'
 import { SymbolWhitelistGuard } from './symbol-whitelist.js'
+import { PerTradeLossCapGuard } from './per-trade-loss-cap.js'
 import { createGuardPipeline } from './guard-pipeline.js'
 import { resolveGuards, registerGuard } from './registry.js'
 import type { GuardContext, OperationGuard } from './types.js'
@@ -20,6 +21,8 @@ function makePlaceOrderOp(overrides: {
   orderType?: string
   cashQty?: number
   totalQuantity?: Decimal
+  lmtPrice?: number
+  stopPrice?: number
 } = {}): Operation {
   const contract = makeContract({ symbol: overrides.symbol ?? 'AAPL' })
   const order = new Order()
@@ -29,7 +32,14 @@ function makePlaceOrderOp(overrides: {
   if (overrides.cashQty != null) {
     order.cashQty = new Decimal(overrides.cashQty)
   }
-  return { action: 'placeOrder', contract, order }
+  if (overrides.lmtPrice != null) {
+    order.lmtPrice = new Decimal(overrides.lmtPrice)
+  }
+  const op: Operation = { action: 'placeOrder', contract, order }
+  if (overrides.stopPrice != null) {
+    op.tpsl = { stopLoss: { price: String(overrides.stopPrice) } }
+  }
+  return op
 }
 
 function makeContext(overrides: {
@@ -345,5 +355,156 @@ describe('registerGuard', () => {
     const guards = resolveGuards([{ type: 'test-custom' }])
     expect(guards).toHaveLength(1)
     expect(guards[0].name).toBe('test-custom')
+  })
+})
+
+// ==================== PerTradeLossCapGuard ====================
+
+describe('PerTradeLossCapGuard', () => {
+  it('rejects an entry with no stop when requireStop is true (default)', () => {
+    const guard = new PerTradeLossCapGuard({ maxPercentOfEquity: 1 })
+    const ctx = makeContext({
+      operation: makePlaceOrderOp({ lmtPrice: 100, totalQuantity: new Decimal(10) }),
+    })
+    const result = guard.check(ctx)
+    expect(result).toContain('no stopLoss declared')
+  })
+
+  it('allows an entry with no stop when requireStop is false', () => {
+    const guard = new PerTradeLossCapGuard({
+      maxPercentOfEquity: 1,
+      requireStop: false,
+    })
+    const ctx = makeContext({
+      operation: makePlaceOrderOp({ lmtPrice: 100, totalQuantity: new Decimal(10) }),
+    })
+    expect(guard.check(ctx)).toBeNull()
+  })
+
+  it('allows a within-cap LMT-with-stop entry', () => {
+    // Equity 100k, cap 1% = $1000.
+    // Entry 100, stop 95, qty 100 → risk = 100 × 5 = 500. Under cap. ✓
+    const guard = new PerTradeLossCapGuard({ maxPercentOfEquity: 1 })
+    const ctx = makeContext({
+      operation: makePlaceOrderOp({
+        lmtPrice: 100,
+        stopPrice: 95,
+        totalQuantity: new Decimal(100),
+      }),
+    })
+    expect(guard.check(ctx)).toBeNull()
+  })
+
+  it('rejects an over-cap LMT-with-stop entry with a useful message', () => {
+    // Equity 100k, cap 1% = $1000.
+    // Entry 100, stop 90, qty 200 → risk = 200 × 10 = 2000. Over cap.
+    const guard = new PerTradeLossCapGuard({ maxPercentOfEquity: 1 })
+    const ctx = makeContext({
+      operation: makePlaceOrderOp({
+        lmtPrice: 100,
+        stopPrice: 90,
+        totalQuantity: new Decimal(200),
+      }),
+    })
+    const result = guard.check(ctx)
+    expect(result).not.toBeNull()
+    expect(result).toContain('$2000') // total risk
+    expect(result).toContain('1%')
+    expect(result).toContain('$1000') // cap
+  })
+
+  it('uses existing-position marketPrice when MKT order has no lmtPrice', () => {
+    // MKT order with no lmtPrice. Existing position has marketPrice 100,
+    // stop 95, qty 100 → risk = 500. Under 1% cap.
+    const guard = new PerTradeLossCapGuard({ maxPercentOfEquity: 1 })
+    const ctx = makeContext({
+      operation: makePlaceOrderOp({
+        stopPrice: 95,
+        totalQuantity: new Decimal(100),
+      }),
+      positions: [
+        makePosition({
+          contract: makeContract({ symbol: 'AAPL' }),
+          marketPrice: '100',
+        }),
+      ],
+    })
+    expect(guard.check(ctx)).toBeNull()
+  })
+
+  it('allows when MKT new symbol cannot be priced', () => {
+    // No lmtPrice, no existing position → can't estimate entry. Allow.
+    // Other guards / broker validation should catch.
+    const guard = new PerTradeLossCapGuard({ maxPercentOfEquity: 1 })
+    const ctx = makeContext({
+      operation: makePlaceOrderOp({
+        stopPrice: 95,
+        totalQuantity: new Decimal(1000),
+      }),
+    })
+    expect(guard.check(ctx)).toBeNull()
+  })
+
+  it('skips SELL (exit) orders', () => {
+    const guard = new PerTradeLossCapGuard({ maxPercentOfEquity: 1 })
+    const ctx = makeContext({
+      operation: makePlaceOrderOp({
+        action: 'SELL',
+        lmtPrice: 100,
+        stopPrice: 95,
+        totalQuantity: new Decimal(10000),
+      }),
+    })
+    expect(guard.check(ctx)).toBeNull()
+  })
+
+  it('skips non-placeOrder operations', () => {
+    const guard = new PerTradeLossCapGuard({ maxPercentOfEquity: 1 })
+    const ctx = makeContext({
+      operation: { action: 'closePosition', contract: makeContract({ symbol: 'AAPL' }) },
+    })
+    expect(guard.check(ctx)).toBeNull()
+  })
+
+  it('handles netLiquidation = 0 without dividing by zero', () => {
+    const guard = new PerTradeLossCapGuard({ maxPercentOfEquity: 1 })
+    const ctx = makeContext({
+      operation: makePlaceOrderOp({
+        lmtPrice: 100,
+        stopPrice: 90,
+        totalQuantity: new Decimal(100),
+      }),
+      account: { netLiquidation: '0' },
+    })
+    expect(guard.check(ctx)).toBeNull() // skip rather than crash
+  })
+
+  it('uses 1% as the default cap when no option is provided', () => {
+    // 1% of 100k = $1000. Risk 100×$10=$1000 → at the cap boundary,
+    // strict-greater-than reject means equality passes.
+    const guard = new PerTradeLossCapGuard({})
+    const ctx = makeContext({
+      operation: makePlaceOrderOp({
+        lmtPrice: 100,
+        stopPrice: 90,
+        totalQuantity: new Decimal(100),
+      }),
+    })
+    expect(guard.check(ctx)).toBeNull()
+  })
+
+  it('respects custom maxPercentOfEquity', () => {
+    // Cap 0.5% of 100k = $500. Risk = 500 → at boundary, allow.
+    // Risk = 600 (qty 120, $5 risk) → over cap.
+    const guard = new PerTradeLossCapGuard({ maxPercentOfEquity: 0.5 })
+    const ctx = makeContext({
+      operation: makePlaceOrderOp({
+        lmtPrice: 100,
+        stopPrice: 95,
+        totalQuantity: new Decimal(120),
+      }),
+    })
+    const result = guard.check(ctx)
+    expect(result).toContain('$600')
   })
 })
