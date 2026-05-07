@@ -5,6 +5,7 @@ import { MaxPositionSizeGuard } from './max-position-size.js'
 import { CooldownGuard } from './cooldown.js'
 import { SymbolWhitelistGuard } from './symbol-whitelist.js'
 import { PerTradeLossCapGuard } from './per-trade-loss-cap.js'
+import { MaxPositionsGuard } from './max-positions.js'
 import { createGuardPipeline } from './guard-pipeline.js'
 import { resolveGuards, registerGuard } from './registry.js'
 import type { GuardContext, OperationGuard } from './types.js'
@@ -506,5 +507,112 @@ describe('PerTradeLossCapGuard', () => {
     })
     const result = guard.check(ctx)
     expect(result).toContain('$600')
+  })
+})
+
+// ==================== MaxPositionsGuard ====================
+
+describe('MaxPositionsGuard', () => {
+  it('allows the first entry into an empty portfolio', () => {
+    const guard = new MaxPositionsGuard({ max: 5 })
+    const ctx = makeContext()
+    expect(guard.check(ctx)).toBeNull()
+  })
+
+  it('allows up to max distinct symbols', () => {
+    const guard = new MaxPositionsGuard({ max: 3 })
+    const ctx = makeContext({
+      operation: makePlaceOrderOp({ symbol: 'NVDA' }),
+      positions: [
+        makePosition({ contract: makeContract({ symbol: 'AAPL' }) }),
+        makePosition({ contract: makeContract({ symbol: 'GOOG' }) }),
+      ],
+    })
+    expect(guard.check(ctx)).toBeNull()
+  })
+
+  it('rejects an entry that would create the (max+1)-th open position', () => {
+    const guard = new MaxPositionsGuard({ max: 3 })
+    const ctx = makeContext({
+      operation: makePlaceOrderOp({ symbol: 'TSLA' }),
+      positions: [
+        makePosition({ contract: makeContract({ symbol: 'AAPL' }) }),
+        makePosition({ contract: makeContract({ symbol: 'GOOG' }) }),
+        makePosition({ contract: makeContract({ symbol: 'NVDA' }) }),
+      ],
+    })
+    const result = guard.check(ctx)
+    expect(result).toContain('limit: 3')
+    expect(result).toContain('AAPL')
+    expect(result).toContain('GOOG')
+    expect(result).toContain('NVDA')
+  })
+
+  it('allows adding to an existing position even at the max count', () => {
+    // 3 positions, max 3 — adding to AAPL doesn't push count up.
+    const guard = new MaxPositionsGuard({ max: 3 })
+    const ctx = makeContext({
+      operation: makePlaceOrderOp({ symbol: 'AAPL' }),
+      positions: [
+        makePosition({ contract: makeContract({ symbol: 'AAPL' }) }),
+        makePosition({ contract: makeContract({ symbol: 'GOOG' }) }),
+        makePosition({ contract: makeContract({ symbol: 'NVDA' }) }),
+      ],
+    })
+    expect(guard.check(ctx)).toBeNull()
+  })
+
+  it('does not count zero-quantity (closed) positions', () => {
+    // Some brokers (Alpaca) keep entries with qty=0 for previously
+    // held symbols. Those shouldn't count toward the cap.
+    const guard = new MaxPositionsGuard({ max: 2 })
+    const ctx = makeContext({
+      operation: makePlaceOrderOp({ symbol: 'TSLA' }),
+      positions: [
+        makePosition({ contract: makeContract({ symbol: 'AAPL' }) }),
+        makePosition({
+          contract: makeContract({ symbol: 'OLDTICK' }),
+          quantity: new Decimal(0),
+        }),
+      ],
+    })
+    expect(guard.check(ctx)).toBeNull() // only 1 open position counts
+  })
+
+  it('skips SELL (exit) orders', () => {
+    const guard = new MaxPositionsGuard({ max: 2 })
+    const ctx = makeContext({
+      operation: makePlaceOrderOp({ action: 'SELL', symbol: 'TSLA' }),
+      positions: [
+        makePosition({ contract: makeContract({ symbol: 'AAPL' }) }),
+        makePosition({ contract: makeContract({ symbol: 'GOOG' }) }),
+      ],
+    })
+    expect(guard.check(ctx)).toBeNull()
+  })
+
+  it('skips non-placeOrder operations', () => {
+    const guard = new MaxPositionsGuard({ max: 1 })
+    const ctx = makeContext({
+      operation: { action: 'closePosition', contract: makeContract({ symbol: 'AAPL' }) },
+    })
+    expect(guard.check(ctx)).toBeNull()
+  })
+
+  it('uses 5 as the default max when no option is provided', () => {
+    const guard = new MaxPositionsGuard({})
+    const ctx = makeContext({
+      operation: makePlaceOrderOp({ symbol: 'NEW' }),
+      positions: Array.from({ length: 5 }, (_, i) =>
+        makePosition({ contract: makeContract({ symbol: `SYM${i}` }) }),
+      ),
+    })
+    const result = guard.check(ctx)
+    expect(result).toContain('limit: 5')
+  })
+
+  it('throws on construction with invalid max', () => {
+    expect(() => new MaxPositionsGuard({ max: 0 })).toThrow(/positive integer/)
+    expect(() => new MaxPositionsGuard({ max: -1 })).toThrow(/positive integer/)
   })
 })
