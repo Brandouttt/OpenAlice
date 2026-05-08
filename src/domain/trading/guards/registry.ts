@@ -6,15 +6,17 @@ import { PerTradeLossCapGuard } from './per-trade-loss-cap.js'
 import { MaxPositionsGuard } from './max-positions.js'
 import { DailyLossCapGuard } from './daily-loss-cap.js'
 import { CircuitBreakerGuard } from './circuit-breaker.js'
+import { PdtDayTradeCounterGuard } from './pdt-day-trade-counter.js'
 
 const builtinGuards: GuardRegistryEntry[] = [
-  { type: 'max-position-size',   create: (opts) => new MaxPositionSizeGuard(opts) },
-  { type: 'cooldown',            create: (opts) => new CooldownGuard(opts) },
-  { type: 'symbol-whitelist',    create: (opts) => new SymbolWhitelistGuard(opts) },
-  { type: 'per-trade-loss-cap',  create: (opts) => new PerTradeLossCapGuard(opts) },
-  { type: 'max-positions',       create: (opts) => new MaxPositionsGuard(opts) },
-  { type: 'daily-loss-cap',      create: (opts) => new DailyLossCapGuard(opts) },
-  { type: 'circuit-breaker',     create: (opts) => new CircuitBreakerGuard(opts) },
+  { type: 'max-position-size',       create: (opts) => new MaxPositionSizeGuard(opts) },
+  { type: 'cooldown',                create: (opts) => new CooldownGuard(opts) },
+  { type: 'symbol-whitelist',        create: (opts) => new SymbolWhitelistGuard(opts) },
+  { type: 'per-trade-loss-cap',      create: (opts) => new PerTradeLossCapGuard(opts) },
+  { type: 'max-positions',           create: (opts) => new MaxPositionsGuard(opts) },
+  { type: 'daily-loss-cap',          create: (opts) => new DailyLossCapGuard(opts) },
+  { type: 'circuit-breaker',         create: (opts) => new CircuitBreakerGuard(opts) },
+  { type: 'pdt-day-trade-counter',   create: (opts) => new PdtDayTradeCounterGuard(opts) },
 ]
 
 const registry = new Map<string, GuardRegistryEntry['create']>(
