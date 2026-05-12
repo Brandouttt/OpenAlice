@@ -28,6 +28,8 @@ import { OpenBBCommodityClient } from './domain/market-data/client/openbb-api/co
 import { createMarketSearchTools } from './tool/market.js'
 import { createAnalysisTools } from './tool/analysis.js'
 import { createBacktestTools } from './tool/backtest.js'
+import { createWatchlistTools } from './tool/watchlist.js'
+import { WatchlistStore } from './domain/watchlist/store.js'
 // Side-effect import: registers built-in strategies (sma-crossover etc.)
 // into the strategy registry. Must run before backtest tools are used.
 import './domain/strategy/index.js'
@@ -239,6 +241,7 @@ async function main() {
   }
   toolCenter.register(createAnalysisTools(equityClient, cryptoClient, currencyClient, commodityClient), 'analysis')
   toolCenter.register(createBacktestTools(equityClient), 'backtest')
+  toolCenter.register(createWatchlistTools(new WatchlistStore()), 'watchlist')
 
   console.log(`tool-center: ${toolCenter.list().length} tools registered`)
 
