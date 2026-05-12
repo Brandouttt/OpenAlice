@@ -8,14 +8,18 @@
 
 import { register } from './registry.js'
 import { smaCrossoverStrategy } from './sma-crossover.js'
+import { leaderPullbackV1Strategy } from './leader-pullback-v1.js'
 
 // Register built-in strategies. Each call is idempotent only if the
 // registry is empty — duplicate registration throws. Don't import
 // this file twice in the same process; tests that need a clean slate
 // should call `_resetRegistryForTests` before re-registering.
 register(smaCrossoverStrategy)
+register(leaderPullbackV1Strategy)
 
 export { register, getStrategy, listStrategies, _resetRegistryForTests } from './registry.js'
 export type { RegisteredStrategy, StrategyMetadata, StrategyParameter, MarketRegime } from './types.js'
 export { smaCrossoverStrategy, makeSmaCrossover, sma, makeMarketOrder } from './sma-crossover.js'
 export type { SmaCrossoverParams } from './sma-crossover.js'
+export { leaderPullbackV1Strategy, makeLeaderPullback, atr } from './leader-pullback-v1.js'
+export type { LeaderPullbackParams } from './leader-pullback-v1.js'
