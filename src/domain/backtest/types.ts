@@ -43,12 +43,42 @@ export interface StrategyContext {
 }
 
 /**
+ * Coarse-grained position description that EVERY strategy must
+ * report. Used by the automation UI as the prominent "what is the
+ * bot doing on this symbol" indicator.
+ *
+ *   flat     — no position, waiting for entry
+ *   long     — fully long (single-tier exit pending)
+ *   short    — fully short
+ *   partial  — partially closed; remaining size tracked under
+ *              trailing-stop or similar
+ *
+ * Strategy-specific fields (entry price, R-multiple, etc.) go into
+ * `details` — render as-is for the UI / commit log.
+ */
+export interface StrategyState {
+  position: 'flat' | 'long' | 'short' | 'partial'
+  /** Strategy-specific introspection fields. Must be JSON-serialisable. */
+  details: Record<string, unknown>
+}
+
+/**
  * A strategy is a function called once per bar. It may stage orders
  * directly via `ctx.broker.placeOrder(...)` etc., or do nothing.
- *
  * Sync or async; the engine awaits the return value.
+ *
+ * Strategies also expose `getState()` (for the UI / automation
+ * worker to read current closure state) and `resetState()` (to
+ * clear in-memory position tracking when the user wants a clean
+ * slate without restarting the process). Both must work safely even
+ * before the first bar — `getState()` returns position='flat' with
+ * empty details, `resetState()` is a no-op when already flat.
  */
-export type Strategy = (ctx: StrategyContext) => Promise<void> | void
+export interface Strategy {
+  (ctx: StrategyContext): Promise<void> | void
+  getState(): StrategyState
+  resetState(): void
+}
 
 // ==================== Config ====================
 

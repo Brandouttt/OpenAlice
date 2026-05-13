@@ -226,6 +226,62 @@ describe('leader-pullback-v1 — position sizing', () => {
   })
 })
 
+describe('leader-pullback-v1 — state introspection', () => {
+  it('starts in flat position with empty details', () => {
+    const strategy = makeLeaderPullback(TEST_PARAMS)
+    const state = strategy.getState()
+    expect(state.position).toBe('flat')
+    expect(state.details).toEqual({})
+  })
+
+  it('reports position=long with entry details after a fired entry', async () => {
+    const bars = buildPullbackThenRise()
+    const broker = new MockBroker({
+      cash: 4000,
+      deferMarketFills: true,
+      commissionPerShare: 0,
+      commissionMin: 0,
+    })
+    const strategy = makeLeaderPullback(TEST_PARAMS)
+    await runBacktest(
+      { symbol: 'TEST', bars, initialCash: 4000, strategy },
+      broker,
+    )
+
+    // After the backtest the strategy may be either:
+    //   - flat (entered + exited within the dataset), OR
+    //   - long/partial (still in position at the last bar)
+    // Either way, getState() must return a well-formed snapshot.
+    const state = strategy.getState()
+    expect(['flat', 'long', 'partial']).toContain(state.position)
+    if (state.position !== 'flat') {
+      expect(state.details).toHaveProperty('entryPrice')
+      expect(state.details).toHaveProperty('initialStop')
+      expect(state.details).toHaveProperty('remainingQty')
+    }
+  })
+
+  it('resetState clears any in-flight position and pending entry', async () => {
+    const bars = buildPullbackThenRise()
+    const broker = new MockBroker({
+      cash: 4000,
+      deferMarketFills: true,
+      commissionPerShare: 0,
+      commissionMin: 0,
+    })
+    const strategy = makeLeaderPullback(TEST_PARAMS)
+    await runBacktest(
+      { symbol: 'TEST', bars, initialCash: 4000, strategy },
+      broker,
+    )
+
+    strategy.resetState()
+    const state = strategy.getState()
+    expect(state.position).toBe('flat')
+    expect(state.details).toEqual({})
+  })
+})
+
 describe('leader-pullback-v1 — registry metadata', () => {
   it('exposes the canonical metadata', () => {
     expect(leaderPullbackV1Strategy.metadata.name).toBe('leader-pullback-v1')

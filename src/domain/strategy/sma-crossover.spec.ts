@@ -33,6 +33,32 @@ describe('makeSmaCrossover validation', () => {
   })
 })
 
+describe('makeSmaCrossover state introspection', () => {
+  it('starts in flat position', () => {
+    const strategy = makeSmaCrossover({ fast: 5, slow: 20, qty: 10 })
+    const state = strategy.getState()
+    expect(state.position).toBe('flat')
+    expect(state.details).toMatchObject({ inPosition: false, fast: 5, slow: 20, qty: 10 })
+  })
+
+  it('resetState restores flat position even after many calls', () => {
+    const strategy = makeSmaCrossover({ fast: 5, slow: 20, qty: 10 })
+    // Force inPosition=true by reading then setting through resetState
+    // We can't externally toggle without an entry signal, so verify
+    // resetState is at least callable and idempotent.
+    strategy.resetState()
+    expect(strategy.getState().position).toBe('flat')
+    strategy.resetState()
+    expect(strategy.getState().position).toBe('flat')
+  })
+
+  it('getState reports parameters in details', () => {
+    const strategy = makeSmaCrossover({ fast: 7, slow: 21, qty: 50 })
+    const details = strategy.getState().details
+    expect(details).toMatchObject({ fast: 7, slow: 21, qty: 50 })
+  })
+})
+
 describe('smaCrossoverStrategy registry entry', () => {
   it('exposes the canonical metadata', () => {
     expect(smaCrossoverStrategy.metadata.name).toBe('sma-crossover')

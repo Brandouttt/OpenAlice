@@ -175,7 +175,9 @@ export function makeLeaderPullback(
     signalDayClose: Decimal
   } | null = null
 
-  return async (ctx) => {
+  // Assigned to a const so we can attach getState / resetState
+  // methods. The IIFE-wrapped function body is otherwise unchanged.
+  const fn: Strategy = (async (ctx) => {
     const { broker, history, bar, index, symbol } = ctx
     const closes = history.map(b => Number(b.close))
 
@@ -330,7 +332,49 @@ export function makeLeaderPullback(
       targetQty: qty,
       signalDayClose: signalClose,
     }
+  }) as Strategy
+
+  fn.getState = () => {
+    // Three observable phases: flat (no position, no pending),
+    // pending (BUY placed, awaiting next-bar fill), full / partial.
+    if (state === null && pendingEntry === null) {
+      return { position: 'flat', details: {} }
+    }
+    if (state === null && pendingEntry !== null) {
+      return {
+        position: 'flat', // not in position yet — order pending fill
+        details: {
+          pendingEntry: {
+            initialStop: pendingEntry.initialStop.toString(),
+            signalBarIndex: pendingEntry.signalBarIndex,
+            targetQty: pendingEntry.targetQty.toString(),
+            signalDayClose: pendingEntry.signalDayClose.toString(),
+          },
+        },
+      }
+    }
+    // state !== null — in position
+    const s = state!
+    return {
+      position: s.phase === 'partial' ? 'partial' : 'long',
+      details: {
+        phase: s.phase,
+        entryPrice: s.entryPrice.toString(),
+        initialStop: s.initialStop.toString(),
+        initialQty: s.initialQty.toString(),
+        remainingQty: s.remainingQty.toString(),
+        entryBarIndex: s.entryBarIndex,
+        highestSinceEntry: s.highestSinceEntry.toString(),
+      },
+    }
   }
+
+  fn.resetState = () => {
+    state = null
+    pendingEntry = null
+  }
+
+  return fn
 }
 
 // ==================== Order helpers ====================

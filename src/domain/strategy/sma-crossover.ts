@@ -71,7 +71,10 @@ export function makeSmaCrossover({ fast, slow, qty }: SmaCrossoverParams): Strat
 
   let inPosition = false
 
-  return async ({ broker, history, symbol }) => {
+  // The callback per bar. Assigned to a `const fn` so we can attach
+  // getState / resetState methods to expose internal closure state
+  // to the automation UI.
+  const fn: Strategy = (async ({ broker, history, symbol }) => {
     if (history.length < slow + 1) return // need slow + 1 to compare prev vs now
 
     const closes = history.map(b => Number(b.close))
@@ -93,7 +96,18 @@ export function makeSmaCrossover({ fast, slow, qty }: SmaCrossoverParams): Strat
       await broker.placeOrder(contract, makeMarketOrder('SELL', qty))
       inPosition = false
     }
+  }) as Strategy
+
+  fn.getState = () => ({
+    position: inPosition ? 'long' : 'flat',
+    details: { inPosition, fast, slow, qty },
+  })
+
+  fn.resetState = () => {
+    inPosition = false
   }
+
+  return fn
 }
 
 // ==================== Registry entry ====================
