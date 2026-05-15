@@ -32,6 +32,7 @@ import { createWatchlistTools } from './tool/watchlist.js'
 import { WatchlistStore } from './domain/watchlist/store.js'
 import { createAutomationTools } from './tool/automation.js'
 import { AutomationStore } from './domain/automation/store.js'
+import { createStrategyWorker } from './domain/automation/strategy-worker.js'
 // Side-effect import: registers built-in strategies (sma-crossover etc.)
 // into the strategy registry. Must run before backtest tools are used.
 import './domain/strategy/index.js'
@@ -244,7 +245,8 @@ async function main() {
   toolCenter.register(createAnalysisTools(equityClient, cryptoClient, currencyClient, commodityClient), 'analysis')
   toolCenter.register(createBacktestTools(equityClient), 'backtest')
   toolCenter.register(createWatchlistTools(new WatchlistStore()), 'watchlist')
-  toolCenter.register(createAutomationTools(new AutomationStore()), 'automation')
+  const automationStore = new AutomationStore()
+  toolCenter.register(createAutomationTools(automationStore), 'automation')
 
   console.log(`tool-center: ${toolCenter.list().length} tools registered`)
 
@@ -292,6 +294,22 @@ async function main() {
   if (config.snapshot.enabled) {
     console.log(`snapshot: scheduler started (every ${config.snapshot.every})`)
   }
+
+  // ==================== Strategy Worker (automation) ====================
+
+  // Disabled by default — user opts in via automation tools / UI.
+  // The job is added to the cron engine so the listener wiring is
+  // ready; flipping `enabled` in the cron job (or here on restart)
+  // is the on/off switch.
+  const strategyWorker = createStrategyWorker({
+    store: automationStore,
+    utaManager,
+    equityClient,
+    cronEngine,
+    registry: listenerRegistry,
+    config: { enabled: false, every: '1h' },
+  })
+  await strategyWorker.start()
 
   // ==================== Heartbeat ====================
 
@@ -463,6 +481,7 @@ async function main() {
     clearInterval(catalogRefreshTimer)
     newsCollector?.stop()
     snapshotScheduler.stop()
+    strategyWorker.stop()
     heartbeat.stop()
     metricsListener.stop()
     cronListener.stop()
