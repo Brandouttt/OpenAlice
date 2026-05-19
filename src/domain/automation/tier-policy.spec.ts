@@ -85,6 +85,41 @@ describe('TierPolicy.classify — notional thresholds', () => {
   })
 })
 
+// ==================== Exit bypass ====================
+
+describe('TierPolicy.classify — SELL / exit bypass', () => {
+  it('SELL of any size auto-pushes (exits must always be allowed)', () => {
+    const policy = createTierPolicy(DEFAULT_TIER_POLICY)
+    const r = policy.classify({
+      contract: makeContract('NVDA'),
+      order: makeOrder({ action: 'SELL', qty: 100, lmtPrice: 500 }), // $50,000
+      balance: '4000',
+    })
+    expect(r.decision).toBe('auto-push')
+    expect(r.reason).toContain('exit')
+  })
+
+  it('SSHORT (cover short) also bypasses', () => {
+    const policy = createTierPolicy(DEFAULT_TIER_POLICY)
+    const r = policy.classify({
+      contract: makeContract('NVDA'),
+      order: makeOrder({ action: 'SSHORT', qty: 50, lmtPrice: 500 }),
+      balance: '4000',
+    })
+    expect(r.decision).toBe('auto-push')
+  })
+
+  it('BUY does NOT bypass — still subject to tier rules', () => {
+    const policy = createTierPolicy(DEFAULT_TIER_POLICY)
+    const r = policy.classify({
+      contract: makeContract('NVDA'),
+      order: makeOrder({ action: 'BUY', qty: 100, lmtPrice: 100 }), // $10,000
+      balance: '4000',
+    })
+    expect(r.decision).toBe('hard-stop')
+  })
+})
+
 // ==================== Boundary conditions ====================
 
 describe('TierPolicy.classify — boundaries', () => {

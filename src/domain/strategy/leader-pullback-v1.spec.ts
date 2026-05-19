@@ -303,3 +303,103 @@ describe('leader-pullback-v1 — registry metadata', () => {
     ).toThrow(/must be less than/)
   })
 })
+
+describe('leader-pullback-v1 — HITL / rejected order response handling', () => {
+  /**
+   * The bug we're guarding against: GitTrackedBroker can return
+   * status='PendingSubmit' (HITL tier — user may reject), or
+   * success=false (hard-stop). The strategy must NOT mark itself
+   * as entered until the order is genuinely accepted; otherwise
+   * its internal state diverges from broker reality.
+   */
+
+  /** Minimal stub broker — full enough for one strategy call. */
+  function stubBrokerWithBuyResponse(buyStatus: 'PendingSubmit' | 'Submitted' | 'Filled', buySuccess = true) {
+    return {
+      id: 'stub',
+      label: 'Stub',
+      placeOrder: async () => ({
+        success: buySuccess,
+        orderId: 'stub-1',
+        orderState: { status: buyStatus },
+      }),
+      getAccount: async () => ({
+        baseCurrency: 'USD',
+        netLiquidation: '4000',
+        totalCashValue: '4000',
+        unrealizedPnL: '0',
+        realizedPnL: '0',
+      }),
+      getPositions: async () => [],
+      // Minimal IBroker conformance — methods called by strategy only
+    } as unknown as Parameters<ReturnType<typeof makeLeaderPullback>>[0]['broker']
+  }
+
+  it('does NOT enter when GitTrackedBroker returns PendingSubmit (HITL)', async () => {
+    const bars = buildPullbackThenRise()
+    const broker = stubBrokerWithBuyResponse('PendingSubmit')
+    const strategy = makeLeaderPullback(TEST_PARAMS)
+
+    // Replay through the bars one at a time so we control the broker
+    // (runBacktest would replace with MockBroker context).
+    for (let i = 0; i < bars.length; i++) {
+      await strategy({
+        bar: bars[i],
+        history: bars.slice(0, i + 1),
+        index: i,
+        broker,
+        symbol: 'TEST',
+      })
+    }
+
+    // The pullback bar should have FIRED a BUY signal (we proved
+    // that in the "enters when ..." test above with a real broker).
+    // With PendingSubmit response, the strategy must STAY flat.
+    const state = strategy.getState()
+    expect(state.position).toBe('flat')
+  })
+
+  it('does NOT enter when broker hard-stops (success=false)', async () => {
+    const bars = buildPullbackThenRise()
+    const broker = stubBrokerWithBuyResponse('Submitted', false) // success: false
+    const strategy = makeLeaderPullback(TEST_PARAMS)
+
+    for (let i = 0; i < bars.length; i++) {
+      await strategy({
+        bar: bars[i],
+        history: bars.slice(0, i + 1),
+        index: i,
+        broker,
+        symbol: 'TEST',
+      })
+    }
+
+    const state = strategy.getState()
+    expect(state.position).toBe('flat')
+  })
+
+  it('DOES enter when broker confirms with Submitted (normal auto-push path)', async () => {
+    // Sanity check the negation of the above tests — ensures the
+    // wasConfirmed guard isn't accidentally blocking the happy path.
+    const bars = buildPullbackThenRise()
+    const broker = stubBrokerWithBuyResponse('Submitted', true)
+    const strategy = makeLeaderPullback(TEST_PARAMS)
+
+    for (let i = 0; i < bars.length; i++) {
+      await strategy({
+        bar: bars[i],
+        history: bars.slice(0, i + 1),
+        index: i,
+        broker,
+        symbol: 'TEST',
+      })
+    }
+
+    // After accepting the BUY, the strategy should advance into a
+    // position on the bar after the signal. Either 'long' or
+    // 'partial' depending on whether TP1 already fired or the
+    // dataset ended while in position.
+    const state = strategy.getState()
+    expect(['long', 'partial']).toContain(state.position)
+  })
+})

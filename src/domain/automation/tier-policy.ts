@@ -85,6 +85,20 @@ export function createTierPolicy(config: TierPolicyConfig = DEFAULT_TIER_POLICY)
       const symbol = (input.contract.symbol ?? '').toUpperCase()
       const isEtf = config.etfSymbols?.has(symbol) ?? false
 
+      // Exits (SELL on existing position, or SSHORT cover) MUST
+      // always be allowed — same rationale as daily-loss-cap. If
+      // we hard-stopped a stop-loss exit on size, the position
+      // would bleed without bound. Mirror the convention used in
+      // the other guards: SELL / SSHORT bypass tier limits.
+      const action = (input.order.action ?? '').toUpperCase()
+      if (action === 'SELL' || action === 'SSHORT' || action === 'BUY_TO_COVER') {
+        return {
+          decision: 'auto-push',
+          notional: notional.toString(),
+          reason: `exit order (${action}) — bypass tier limits`,
+        }
+      }
+
       // ETF exemption (when enabled): ETF orders bypass tier-2 → always auto
       if (config.tier1EtfOnly && isEtf) {
         return {

@@ -400,4 +400,38 @@ describe('strategy-worker start / stop', () => {
       expect(registry.unregister).toHaveBeenCalled()
     })
   })
+
+  it('does NOT overwrite an existing cron job (user enable state preserved across restarts)', async () => {
+    // The original bug: every restart called cronEngine.update with
+    // config.enabled, silently turning OFF the user's automation
+    // because main.ts hard-codes config.enabled=false at boot. This
+    // test pins the fix: when the cron job already exists, leave it
+    // alone.
+    await withStore(async (store) => {
+      _resetRegistryForTests()
+      registerStrategy(smaCrossoverStrategy)
+
+      // Simulate "the cron job is already there from a previous run"
+      const existingJob = { id: 'job-1', name: '__strategy-worker__' }
+      const cronEngine = {
+        list: vi.fn().mockReturnValue([existingJob]),
+        add: vi.fn().mockResolvedValue('job-1'),
+        update: vi.fn().mockResolvedValue(undefined),
+      } as unknown as Parameters<typeof createStrategyWorker>[0]['cronEngine']
+
+      const worker = createStrategyWorker({
+        store,
+        utaManager: mockUtaManager({}),
+        equityClient: mockEquityClient([]),
+        cronEngine,
+        registry: mockRegistry(),
+        // config.enabled=false should NOT clobber the existing job
+        config: { enabled: false, every: '1h' },
+      })
+
+      await worker.start()
+      expect(cronEngine.update).not.toHaveBeenCalled()
+      expect(cronEngine.add).not.toHaveBeenCalled()
+    })
+  })
 })

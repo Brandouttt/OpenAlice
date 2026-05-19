@@ -286,10 +286,14 @@ export function createStrategyWorker(deps: {
     async start() {
       const existing = cronEngine.list().find(j => j.name === STRATEGY_WORKER_JOB_NAME)
       if (existing) {
-        await cronEngine.update(existing.id, {
-          schedule: { kind: 'every', every: config.every },
-          enabled: config.enabled,
-        })
+        // IMPORTANT: when the cron job already exists (i.e. this is
+        // not first-ever startup), do NOT touch it. Earlier versions
+        // overwrote `enabled` here, which silently turned off
+        // automation on every process restart and confused users.
+        //
+        // The user controls the cron job state via UI / tools after
+        // first-ever creation. config.enabled is only the BOOTSTRAP
+        // default for fresh installs.
       } else {
         await cronEngine.add({
           name: STRATEGY_WORKER_JOB_NAME,

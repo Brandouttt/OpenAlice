@@ -224,9 +224,14 @@ export function makeLeaderPullback(
         : state.initialStop
 
       if (low.lt(effectiveStop) || close.lt(effectiveStop)) {
-        // Close remaining
-        await placeSell(broker, symbol, state.remainingQty)
-        state = null
+        // Close remaining. GUARD: only clear internal state when
+        // the broker actually accepted the exit. If a guard rejects
+        // (e.g. cooldown spec) the position is still open — leave
+        // state as-is and the next bar will re-attempt.
+        const exitResult = await placeSell(broker, symbol, state.remainingQty)
+        if (wasConfirmed(exitResult)) {
+          state = null
+        }
         return
       }
 
@@ -235,8 +240,10 @@ export function makeLeaderPullback(
       if (barsHeld >= p.timeStopBars) {
         const minHigh = state.entryPrice.mul(1 + p.timeStopMinReturnPct / 100)
         if (state.highestSinceEntry.lt(minHigh)) {
-          await placeSell(broker, symbol, state.remainingQty)
-          state = null
+          const exitResult = await placeSell(broker, symbol, state.remainingQty)
+          if (wasConfirmed(exitResult)) {
+            state = null
+          }
           return
         }
       }
@@ -250,9 +257,14 @@ export function makeLeaderPullback(
             .mul(p.tp1ScaleOutPct / 100)
             .floor()
           if (sellQty.gt(0)) {
-            await placeSell(broker, symbol, sellQty)
-            state.remainingQty = state.remainingQty.minus(sellQty)
-            state.phase = 'partial'
+            const sellResult = await placeSell(broker, symbol, sellQty)
+            // Only progress to 'partial' phase if the partial close
+            // actually went through. Otherwise stay in 'full' and
+            // retry on the next bar that still meets the TP1 trigger.
+            if (wasConfirmed(sellResult)) {
+              state.remainingQty = state.remainingQty.minus(sellQty)
+              state.phase = 'partial'
+            }
           }
         }
       }
@@ -324,7 +336,15 @@ export function makeLeaderPullback(
     if (qty.lte(0)) return
 
     // Place BUY — fills at next bar's open under deferred-fill mode.
-    await placeBuy(broker, symbol, qty.toNumber())
+    // GUARD: only set pendingEntry when the broker actually accepted
+    // the order. If GitTrackedBroker classifies this as Tier 2 (HITL)
+    // it returns status='PendingSubmit' — the human may reject, so we
+    // must NOT progress strategy state assuming fill. If hard-stopped
+    // (Tier 3) success=false. Either way: abandon this signal, the
+    // strategy will re-evaluate on next bar.
+    const buyResult = await placeBuy(broker, symbol, qty.toNumber())
+    if (!wasConfirmed(buyResult)) return
+
     pendingEntry = {
       signalDayLow: new Decimal(lowNum),
       initialStop,
@@ -379,16 +399,33 @@ export function makeLeaderPullback(
 
 // ==================== Order helpers ====================
 
-async function placeBuy(broker: IBroker, symbol: string, qty: number): Promise<void> {
-  const contract = makeContract({ symbol, aliceId: `mock-paper|${symbol}` })
-  await broker.placeOrder(contract, makeMarketOrder('BUY', qty))
+/**
+ * An order is "confirmed" when the broker accepted it AND it's not
+ * sitting in a pending-approval state. In backtest + auto-push live
+ * mode the status is 'Submitted' or 'Filled'. In HITL mode the
+ * GitTrackedBroker returns 'PendingSubmit' — the user may reject,
+ * so the strategy must NOT progress internal state as if filled.
+ *
+ * Strategies should call this on every broker response before
+ * mutating their own position tracking.
+ */
+function wasConfirmed(result: { success: boolean; orderState?: { status?: string } } | undefined): boolean {
+  if (!result || !result.success) return false
+  const status = result.orderState?.status
+  if (status === 'PendingSubmit') return false
+  return true
 }
 
-async function placeSell(broker: IBroker, symbol: string, qty: Decimal): Promise<void> {
-  const qtyNum = qty.toNumber()
-  if (qtyNum <= 0) return
+async function placeBuy(broker: IBroker, symbol: string, qty: number) {
   const contract = makeContract({ symbol, aliceId: `mock-paper|${symbol}` })
-  await broker.placeOrder(contract, makeMarketOrder('SELL', qtyNum))
+  return broker.placeOrder(contract, makeMarketOrder('BUY', qty))
+}
+
+async function placeSell(broker: IBroker, symbol: string, qty: Decimal) {
+  const qtyNum = qty.toNumber()
+  if (qtyNum <= 0) return undefined
+  const contract = makeContract({ symbol, aliceId: `mock-paper|${symbol}` })
+  return broker.placeOrder(contract, makeMarketOrder('SELL', qtyNum))
 }
 
 // ==================== Registry entry ====================
