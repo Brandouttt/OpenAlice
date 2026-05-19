@@ -52,9 +52,48 @@ function mockUtaManager(utas: Record<string, { broker: MockBroker; disabled?: bo
     get: vi.fn((id: string) => {
       const u = utas[id]
       if (!u) return undefined
+      // GitTrackedBroker now routes placeOrder through uta.git +
+      // uta.push(), and the worker reads uta.status() to detect
+      // newly-pending HITL commits. Stub all three so the wrapper
+      // path doesn't crash. The mock git is a no-op store —
+      // intercepted orders are not actually persisted, which is
+      // fine for these unit tests.
+      const stagedOps: unknown[] = []
+      let pendingHash: string | null = null
+      let pendingMessage: string | null = null
+      const fakeGit = {
+        add: vi.fn((op: unknown) => {
+          stagedOps.push(op)
+        }),
+        commit: vi.fn((message: string) => {
+          pendingHash = 'mock' + (stagedOps.length).toString().padStart(4, '0')
+          pendingMessage = message
+        }),
+      }
       return {
         broker: u.broker,
         disabled: u.disabled ?? false,
+        id: 'mock-uta',
+        git: fakeGit,
+        status: () => ({
+          staged: stagedOps,
+          pendingMessage,
+          pendingHash,
+          head: null,
+          commitCount: 0,
+        }),
+        push: vi.fn(async () => ({
+          hash: pendingHash ?? '',
+          message: pendingMessage ?? '',
+          operationCount: stagedOps.length,
+          submitted: [{
+            action: 'placeOrder',
+            success: true,
+            status: 'submitted',
+            orderId: 'mock-1',
+          }],
+          rejected: [],
+        })),
       }
     }),
   } as unknown as UTAManager

@@ -36,10 +36,13 @@ import type { Listener } from '../../core/listener.js'
 import type { ListenerRegistry } from '../../core/listener-registry.js'
 import type { UTAManager } from '../trading/uta-manager.js'
 import type { EquityClientLike } from '../market-data/client/types.js'
+import type { ConnectorCenter } from '../../core/connector-center.js'
 import type { AutomationStore } from './store.js'
 import type { Strategy, Bar } from '../backtest/types.js'
 import { getStrategy } from '../strategy/index.js'
 import { automationKey, type AutomationEntry } from './types.js'
+import { GitTrackedBroker } from './git-tracked-broker.js'
+import { createTierPolicy, DEFAULT_TIER_POLICY, type TierPolicyConfig } from './tier-policy.js'
 
 const STRATEGY_WORKER_JOB_NAME = '__strategy-worker__'
 
@@ -51,6 +54,11 @@ export interface StrategyWorkerConfig {
   every: string
   /** How many recent daily bars to fetch per tick. Default 60. */
   historyBars?: number
+  /**
+   * Tier policy used by GitTrackedBroker to classify orders into
+   * auto-push / HITL / hard-stop. Default DEFAULT_TIER_POLICY (300 / 1000).
+   */
+  tierPolicy?: TierPolicyConfig
 }
 
 export interface StrategyWorker {
@@ -73,9 +81,17 @@ export function createStrategyWorker(deps: {
   cronEngine: CronEngine
   registry: ListenerRegistry
   config: StrategyWorkerConfig
+  /**
+   * Optional. When set, the worker pushes a notification through
+   * connectorCenter (Telegram + Web) whenever a strategy creates a
+   * new HITL-pending commit. Without this, the user must manually
+   * open the trading panel to see pending orders.
+   */
+  connectorCenter?: ConnectorCenter
 }): StrategyWorker {
-  const { store, utaManager, equityClient, cronEngine, registry, config } = deps
+  const { store, utaManager, equityClient, cronEngine, registry, config, connectorCenter } = deps
   const historyBars = config.historyBars ?? DEFAULT_HISTORY_BARS
+  const tierPolicy = createTierPolicy(config.tierPolicy ?? DEFAULT_TIER_POLICY)
 
   // Strategy closure cache, keyed by automationKey. Survives across
   // ticks but not across process restarts.
@@ -139,7 +155,21 @@ export function createStrategyWorker(deps: {
       strategyCache.set(key, strategy)
     }
 
-    // 5. Call strategy with the latest bar.
+    // 5. Wrap the broker so strategy orders flow through TradingGit.
+    //    Tier policy decides auto-push vs HITL approval vs hard-stop.
+    //    Read methods delegate straight to the underlying broker.
+    const trackedBroker = new GitTrackedBroker({
+      inner: uta.broker,
+      uta,
+      tierPolicy,
+      strategyName: entry.strategyName,
+    })
+
+    // 6. Capture pre-call pending state so we can detect a new
+    //    HITL commit after the strategy runs.
+    const pendingBefore = uta.status().pendingHash
+
+    // 7. Call strategy with the latest bar.
     //
     // The worker presents the FULL recent history (last `historyBars`
     // entries). The strategy reads from `history` and decides on the
@@ -150,9 +180,33 @@ export function createStrategyWorker(deps: {
       bar: latestBar,
       history: bars,
       index: bars.length - 1,
-      broker: uta.broker,
+      broker: trackedBroker,
       symbol: entry.symbol,
     })
+
+    // 8. If a new HITL commit was created by the strategy, push a
+    //    notification through the connector center so the user
+    //    sees it on mobile / Web UI.
+    const statusAfter = uta.status()
+    if (
+      connectorCenter &&
+      statusAfter.pendingHash &&
+      statusAfter.pendingHash !== pendingBefore
+    ) {
+      const opCount = statusAfter.staged.length
+      const text =
+        `📋 ${entry.strategyName} on ${entry.symbol} (${entry.accountId}) ` +
+        `staged ${opCount} op${opCount > 1 ? 's' : ''} for approval. ` +
+        `Open /trading on Telegram or the Trading panel to Approve / Reject.`
+      try {
+        await connectorCenter.notify(text, { source: 'strategy-worker' })
+      } catch (err) {
+        console.warn(
+          'strategy-worker: notify failed:',
+          err instanceof Error ? err.message : err,
+        )
+      }
+    }
   }
 
   async function fetchBars(symbol: string): Promise<Bar[]> {

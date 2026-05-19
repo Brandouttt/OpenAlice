@@ -308,6 +308,7 @@ async function main() {
     cronEngine,
     registry: listenerRegistry,
     config: { enabled: false, every: '1h' },
+    connectorCenter,
   })
   await strategyWorker.start()
 
