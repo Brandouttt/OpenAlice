@@ -19,6 +19,7 @@ import { diaryApi } from './diary'
 import { brainApi } from './brain'
 import { topologyApi } from './topology'
 import { marketApi } from './market'
+import { automationApi } from './automation'
 export const api = {
   chat: chatApi,
   config: configApi,
@@ -37,6 +38,7 @@ export const api = {
   brain: brainApi,
   topology: topologyApi,
   market: marketApi,
+  automation: automationApi,
 }
 
 // Re-export all types for convenience

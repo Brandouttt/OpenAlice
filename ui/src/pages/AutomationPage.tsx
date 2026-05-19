@@ -7,6 +7,7 @@ import { useAutoSave } from '../hooks/useAutoSave'
 import { PageHeader } from '../components/PageHeader'
 import { AutomationFlowSection } from './AutomationFlowSection'
 import { AutomationWebhookSection } from './AutomationWebhookSection'
+import { AutomationStrategySection } from './AutomationStrategySection'
 
 // ==================== Helpers ====================
 
@@ -598,10 +599,11 @@ function AddCronJobForm({ onClose, onCreated }: { onClose: () => void; onCreated
 
 // ==================== Page ====================
 
-type Tab = 'flow' | 'heartbeat' | 'cron' | 'webhook'
+type Tab = 'flow' | 'strategy' | 'heartbeat' | 'cron' | 'webhook'
 
 const TABS: { key: Tab; label: string }[] = [
   { key: 'flow', label: 'Flow' },
+  { key: 'strategy', label: 'Strategy' },
   { key: 'heartbeat', label: 'Heartbeat' },
   { key: 'cron', label: 'Cron Jobs' },
   { key: 'webhook', label: 'Webhook' },
@@ -640,6 +642,8 @@ export function AutomationPage() {
         <div className="flex-1 min-h-0">
           {tab === 'flow' ? (
             <AutomationFlowSection />
+          ) : tab === 'strategy' ? (
+            <AutomationStrategySection />
           ) : tab === 'heartbeat' ? (
             <HeartbeatSection />
           ) : tab === 'cron' ? (

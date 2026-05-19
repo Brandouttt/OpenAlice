@@ -446,6 +446,8 @@ async function main() {
     marketSearch,
     utaManager, fxService, snapshotService,
     newsProvider: newsStore,
+    automationStore,
+    strategyWorker,
     reconnectConnectors,
   }
 

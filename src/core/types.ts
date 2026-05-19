@@ -6,6 +6,8 @@ import type { INewsProvider } from '../domain/news/types.js'
 import type { MarketSearchDeps } from '../domain/market-data/aggregate-search.js'
 import type { CronEngine } from '../task/cron/engine.js'
 import type { Heartbeat } from '../task/heartbeat/index.js'
+import type { AutomationStore } from '../domain/automation/store.js'
+import type { StrategyWorker } from '../domain/automation/strategy-worker.js'
 import type { Config, WebChannel } from './config.js'
 import type { ConnectorCenter } from './connector-center.js'
 import type { AgentCenter } from './agent-center.js'
@@ -54,6 +56,11 @@ export interface EngineContext {
   fxService: FxService
   snapshotService?: SnapshotService
   newsProvider?: INewsProvider
+
+  // Automation (Phase 3.7)
+  automationStore: AutomationStore
+  strategyWorker: StrategyWorker
+
   /** Reconnect connector plugins (Telegram, MCP-Ask, etc.). */
   reconnectConnectors: () => Promise<ReconnectResult>
 }
