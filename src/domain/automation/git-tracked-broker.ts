@@ -129,6 +129,22 @@ export class GitTrackedBroker implements IBroker {
       }
     }
 
+    // Pending-commit collision check. TradingGit holds at most one
+    // pending commit at a time. If a previous order (HITL tier) is
+    // still waiting for approval, this entry's commit would throw.
+    // Return failure gracefully so the strategy can retry next tick
+    // — same pattern as the Phase 3.3 fix for placeOrder responses.
+    const status = this.uta.status()
+    if (status.pendingMessage) {
+      return {
+        success: false,
+        error:
+          `Cannot stage new order: account "${this.uta.id}" already ` +
+          `has a pending commit (${status.pendingHash ?? '?'}) awaiting ` +
+          `approval. Approve or reject the pending one first.`,
+      }
+    }
+
     // Stage + commit
     this.uta.git.add({ action: 'placeOrder', contract, order, tpsl })
     const message = this.formatCommitMessage(order, contract)

@@ -97,6 +97,16 @@ export function createStrategyWorker(deps: {
   // ticks but not across process restarts.
   const strategyCache = new Map<string, Strategy>()
 
+  /**
+   * Last bar timestamp processed per (account, symbol, strategy).
+   * Used to skip redundant strategy runs when the cron fires multiple
+   * times against the same data (e.g. weekends, market holidays,
+   * pre-market hours when no new bar has arrived). Without this dedup,
+   * strategies in HITL-pending state would repeatedly re-fire orders
+   * each tick and collide with the existing pending commit.
+   */
+  const lastBarTsCache = new Map<string, number>()
+
   let processing = false
   let registered = false
 
@@ -144,8 +154,18 @@ export function createStrategyWorker(deps: {
       throw new Error(`Insufficient bars (got ${bars.length}, need ≥2)`)
     }
 
-    // 4. Get-or-build strategy closure
+    // 4. Bar dedup. If the latest bar's timestamp matches the one
+    //    we already processed for this entry, skip — re-running the
+    //    strategy on identical data produces identical decisions and
+    //    risks collision with any pending commit it already staged.
     const key = automationKey(entry)
+    const latestTs = bars[bars.length - 1].ts.getTime()
+    if (lastBarTsCache.get(key) === latestTs) {
+      return // already processed this exact bar
+    }
+    lastBarTsCache.set(key, latestTs)
+
+    // 5. Get-or-build strategy closure
     let strategy = strategyCache.get(key)
     if (!strategy) {
       strategy = registered.factory({

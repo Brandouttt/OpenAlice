@@ -148,7 +148,19 @@ interface TradeState {
   entryPrice: Decimal     // realised fill price (next-bar open after signal)
   signalDayLow: Decimal   // for stop computation
   initialStop: Decimal
-  entryBarIndex: number
+  /**
+   * Bar timestamp on the day the entry FILLED. Used to count bars
+   * held for the time-stop rule.
+   *
+   * Why timestamp instead of an integer index: in backtest mode the
+   * engine feeds bars sequentially with index 0..N-1, so integer
+   * indexing works. But the live worker re-fetches the most-recent
+   * 60 bars every tick and always passes index = length-1. With
+   * integer indexing, barsHeld would compute as 0 forever and the
+   * time-stop would never fire. Timestamp comparison works in both
+   * modes.
+   */
+  entryDate: Date
   initialQty: Decimal
   remainingQty: Decimal
   highestSinceEntry: Decimal
@@ -170,7 +182,8 @@ export function makeLeaderPullback(
   let pendingEntry: {
     signalDayLow: Decimal
     initialStop: Decimal
-    signalBarIndex: number
+    /** Bar timestamp on the signal day (the day the BUY was placed). */
+    signalDate: Date
     targetQty: Decimal
     signalDayClose: Decimal
   } | null = null
@@ -193,7 +206,7 @@ export function makeLeaderPullback(
         entryPrice: new Decimal(bar.open),
         signalDayLow: pendingEntry.signalDayLow,
         initialStop: pendingEntry.initialStop,
-        entryBarIndex: index,
+        entryDate: bar.ts,
         initialQty: pendingEntry.targetQty,
         remainingQty: pendingEntry.targetQty,
         highestSinceEntry: new Decimal(bar.high),
@@ -235,8 +248,12 @@ export function makeLeaderPullback(
         return
       }
 
-      // 2. Time stop
-      const barsHeld = index - state.entryBarIndex
+      // 2. Time stop — count bars in the visible history whose
+      //    timestamp is STRICTLY AFTER entryDate. Works in both
+      //    backtest (sequential bars) and live (fresh-window fetch)
+      //    because it doesn't depend on `index`.
+      const entryMs = state.entryDate.getTime()
+      const barsHeld = history.filter(b => b.ts.getTime() > entryMs).length
       if (barsHeld >= p.timeStopBars) {
         const minHigh = state.entryPrice.mul(1 + p.timeStopMinReturnPct / 100)
         if (state.highestSinceEntry.lt(minHigh)) {
@@ -348,7 +365,7 @@ export function makeLeaderPullback(
     pendingEntry = {
       signalDayLow: new Decimal(lowNum),
       initialStop,
-      signalBarIndex: index,
+      signalDate: bar.ts,
       targetQty: qty,
       signalDayClose: signalClose,
     }
@@ -366,7 +383,7 @@ export function makeLeaderPullback(
         details: {
           pendingEntry: {
             initialStop: pendingEntry.initialStop.toString(),
-            signalBarIndex: pendingEntry.signalBarIndex,
+            signalDate: pendingEntry.signalDate.toISOString(),
             targetQty: pendingEntry.targetQty.toString(),
             signalDayClose: pendingEntry.signalDayClose.toString(),
           },
@@ -383,7 +400,7 @@ export function makeLeaderPullback(
         initialStop: s.initialStop.toString(),
         initialQty: s.initialQty.toString(),
         remainingQty: s.remainingQty.toString(),
-        entryBarIndex: s.entryBarIndex,
+        entryDate: s.entryDate.toISOString(),
         highestSinceEntry: s.highestSinceEntry.toString(),
       },
     }

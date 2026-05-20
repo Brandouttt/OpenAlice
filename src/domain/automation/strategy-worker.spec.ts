@@ -353,6 +353,149 @@ describe('strategy-worker tick', () => {
       expect(factoryCount).toBe(1)
     })
   })
+
+  it('dedups consecutive ticks against the same latest bar — strategy not re-invoked', async () => {
+    // The bug: when cron fires multiple times with no new bar
+    // arrived (weekends, market holidays, pre-market), the strategy
+    // would re-run on identical data and re-attempt orders. With
+    // HITL pending state this collides with the existing commit.
+    await withStore(async (store) => {
+      _resetRegistryForTests()
+
+      // Spy strategy — counts how many times onBar runs across ticks.
+      let onBarCalls = 0
+      registerStrategy({
+        metadata: smaCrossoverStrategy.metadata,
+        factory: (params) => {
+          const inner = smaCrossoverStrategy.factory(params)
+          const wrapped = (async (ctx: Parameters<typeof inner>[0]) => {
+            onBarCalls++
+            return inner(ctx)
+          }) as typeof inner
+          wrapped.getState = inner.getState.bind(inner)
+          wrapped.resetState = inner.resetState.bind(inner)
+          return wrapped
+        },
+      })
+
+      await store.upsert({
+        accountId: 'paper-mock',
+        symbol: 'NVDA',
+        strategyName: 'sma-crossover',
+        enabled: true,
+      })
+
+      // Same 60-bar data returned on every fetch. Tick 1 runs;
+      // ticks 2 and 3 should detect the same latest bar and skip.
+      const worker = createStrategyWorker({
+        store,
+        utaManager: mockUtaManager({
+          'paper-mock': { broker: new MockBroker() },
+        }),
+        equityClient: mockEquityClient(flatBars(60)),
+        cronEngine: mockCronEngine(),
+        registry: mockRegistry(),
+        config: { enabled: true, every: '1h' },
+      })
+
+      await worker.tick()
+      await worker.tick()
+      await worker.tick()
+
+      expect(onBarCalls).toBe(1)
+    })
+  })
+
+  it('runs again when the latest bar timestamp changes (new day)', async () => {
+    await withStore(async (store) => {
+      _resetRegistryForTests()
+      let onBarCalls = 0
+      registerStrategy({
+        metadata: smaCrossoverStrategy.metadata,
+        factory: (params) => {
+          const inner = smaCrossoverStrategy.factory(params)
+          const wrapped = (async (ctx: Parameters<typeof inner>[0]) => {
+            onBarCalls++
+            return inner(ctx)
+          }) as typeof inner
+          wrapped.getState = inner.getState.bind(inner)
+          wrapped.resetState = inner.resetState.bind(inner)
+          return wrapped
+        },
+      })
+
+      await store.upsert({
+        accountId: 'paper-mock',
+        symbol: 'NVDA',
+        strategyName: 'sma-crossover',
+        enabled: true,
+      })
+
+      // First fetch: 60 bars.
+      const firstBars = flatBars(60)
+      // Second fetch: ONE more bar appended (simulates "next trading
+      // day arrived").
+      const secondBars = [...firstBars, {
+        date: '2024-04-15',
+        open: 105,
+        high: 105 * 1.005,
+        low: 105 * 0.995,
+        close: 105,
+        volume: 1_000_000,
+      }]
+
+      // Switch the client's return value between ticks by spying on
+      // it. The default mockEquityClient closes over its `historical`
+      // array, so we need to build two separate clients OR rebuild
+      // the closure. Simpler: just create the second worker — same
+      // store, fresh worker per tick = fresh client.
+      const worker1 = createStrategyWorker({
+        store,
+        utaManager: mockUtaManager({ 'paper-mock': { broker: new MockBroker() } }),
+        equityClient: mockEquityClient(firstBars),
+        cronEngine: mockCronEngine(),
+        registry: mockRegistry(),
+        config: { enabled: true, every: '1h' },
+      })
+      await worker1.tick()
+
+      // Tick the SAME worker with fresh data — to do this we need
+      // the same worker to see different data. Easiest: pass a
+      // mutable container the mock client reads from.
+      // For simplicity, use a single worker built once but with a
+      // mutable bars source:
+      let currentBars = firstBars
+      const mutableClient = {
+        search: vi.fn().mockResolvedValue([]),
+        getHistorical: vi.fn(async () => currentBars),
+        getProfile: vi.fn(), getKeyMetrics: vi.fn(), getIncomeStatement: vi.fn(),
+        getBalanceSheet: vi.fn(), getCashFlow: vi.fn(), getFinancialRatios: vi.fn(),
+        getEstimateConsensus: vi.fn(), getCalendarEarnings: vi.fn(),
+        getInsiderTrading: vi.fn(), getGainers: vi.fn(),
+        getLosers: vi.fn(), getActive: vi.fn(),
+      } as unknown as Parameters<typeof createStrategyWorker>[0]['equityClient']
+
+      onBarCalls = 0 // reset
+      const worker2 = createStrategyWorker({
+        store,
+        utaManager: mockUtaManager({ 'paper-mock': { broker: new MockBroker() } }),
+        equityClient: mutableClient,
+        cronEngine: mockCronEngine(),
+        registry: mockRegistry(),
+        config: { enabled: true, every: '1h' },
+      })
+
+      await worker2.tick()         // tick 1 with firstBars  → runs
+      expect(onBarCalls).toBe(1)
+
+      await worker2.tick()         // tick 2, same data       → skipped
+      expect(onBarCalls).toBe(1)
+
+      currentBars = secondBars     // new bar arrives
+      await worker2.tick()         // tick 3, new data        → runs
+      expect(onBarCalls).toBe(2)
+    })
+  })
 })
 
 // ==================== start / stop ====================

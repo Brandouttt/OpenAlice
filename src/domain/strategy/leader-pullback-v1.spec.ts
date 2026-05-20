@@ -403,3 +403,119 @@ describe('leader-pullback-v1 — HITL / rejected order response handling', () =>
     expect(['long', 'partial']).toContain(state.position)
   })
 })
+
+describe('leader-pullback-v1 — time-stop in live-worker bar-window mode', () => {
+  /**
+   * Regression for the bug where time-stop used `index - entryBarIndex`,
+   * which worked in backtest (monotonic indices) but failed in live
+   * mode because the worker re-fetches the most-recent 60 bars every
+   * tick and always passes index = history.length - 1. Days held was
+   * stuck at 0.
+   *
+   * Fix: TradeState tracks entryDate (Date) and barsHeld is the
+   * count of bars in history with ts > entryDate.
+   */
+
+  /** Stub broker that returns Filled for both BUY and SELL. */
+  function fillingStubBroker() {
+    return {
+      id: 'stub',
+      label: 'Stub',
+      placeOrder: async () => ({
+        success: true,
+        orderId: 'stub-1',
+        orderState: { status: 'Submitted' },
+      }),
+      getAccount: async () => ({
+        baseCurrency: 'USD',
+        netLiquidation: '4000',
+        totalCashValue: '4000',
+        unrealizedPnL: '0',
+        realizedPnL: '0',
+      }),
+      getPositions: async () => [],
+    } as unknown as Parameters<ReturnType<typeof makeLeaderPullback>>[0]['broker']
+  }
+
+  /**
+   * Build a flat-then-pullback-then-flat history. After entry the
+   * price stays at 113 (no new highs), so the strategy never gets a
+   * fresh-high reset. After `timeStopBars` flat days, the time-stop
+   * MUST fire and exit. Time-stop trigger requires:
+   *   highestSinceEntry < entry × (1 + timeStopMinReturnPct/100)
+   * With entry ≈ 113 and 5% threshold = 118.65 — keeping price at 113
+   * easily fails the rule, so time-stop trips on schedule.
+   */
+  function buildPullbackThenFlat(stagnantBars: number): Bar[] {
+    startDate('2024-01-02T00:00:00Z')
+    const bars: Bar[] = []
+    for (let i = 0; i < 30; i++) {
+      const price = 100 + (15 * i) / 29
+      bars.push(flatBar(price, 1_000_000))
+    }
+    bars.push(ohlcvBar(115, 115, 112, 113, 1_500_000))
+    // Hold flat at 113 for `stagnantBars` days
+    for (let i = 0; i < stagnantBars; i++) {
+      bars.push(flatBar(113, 1_200_000))
+    }
+    return bars
+  }
+
+  it('time-stop fires after timeStopBars in LIVE mode (constant index = length-1)', async () => {
+    // Use small timeStopBars so the fixture stays reasonable.
+    const params = { ...TEST_PARAMS, timeStopBars: 3 }
+    const strategy = makeLeaderPullback(params)
+    const broker = fillingStubBroker()
+
+    // 30 warmup + 1 pullback + 10 flat = 41 bars, more than enough
+    // to fire entry + sit for >3 days + observe time-stop.
+    const fullBars = buildPullbackThenFlat(10)
+
+    // CRITICAL: simulate the live worker pattern — every "tick"
+    // the worker fetches a fresh window of the most recent bars
+    // and passes index = history.length - 1 (NOT monotonic).
+    // We replay one bar at a time but always pass index = last.
+    for (let i = 0; i < fullBars.length; i++) {
+      const windowed = fullBars.slice(0, i + 1)
+      await strategy({
+        bar: windowed[windowed.length - 1],
+        history: windowed,
+        index: windowed.length - 1, // ← always max, mirrors live worker
+        broker,
+        symbol: 'TEST',
+      })
+    }
+
+    // After timeStopBars (3) flat days post-entry, strategy should
+    // have time-stopped out. State must be flat.
+    const state = strategy.getState()
+    expect(state.position).toBe('flat')
+  })
+
+  it('does NOT time-stop within the timeStopBars window', async () => {
+    // Negation of the above: with timeStopBars=10 (default) and only
+    // 9 bars in the rising phase after entry, barsHeld never reaches
+    // the threshold so time-stop physically cannot fire. Confirms
+    // the new entryDate counter doesn't fire prematurely.
+    const params = { ...TEST_PARAMS, timeStopBars: 10 }
+    const strategy = makeLeaderPullback(params)
+    const broker = fillingStubBroker()
+    const fullBars = buildPullbackThenRise() // 9 rising bars post-pullback
+
+    for (let i = 0; i < fullBars.length; i++) {
+      const windowed = fullBars.slice(0, i + 1)
+      await strategy({
+        bar: windowed[windowed.length - 1],
+        history: windowed,
+        index: windowed.length - 1,
+        broker,
+        symbol: 'TEST',
+      })
+    }
+
+    // Strategy stays in position — couldn't have time-stopped within
+    // the 10-bar window because only 9 post-entry bars exist.
+    const state = strategy.getState()
+    expect(['long', 'partial']).toContain(state.position)
+  })
+})
